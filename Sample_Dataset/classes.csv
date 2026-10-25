@@ -1,0 +1,21 @@
+class_id,programme,semester,section,student_count
+CSE301,CSE,3,A,60
+CSE302,CSE,3,B,58
+CSE501,CSE,5,A,55
+CSE502,CSE,5,B,52
+CC501,Cloud Computing,5,A,42
+CC502,Cloud Computing,5,B,40
+AIML501,AI & ML,5,A,48
+AIML502,AI & ML,5,B,46
+CSE701,CSE,7,A,45
+CSE702,CSE,7,B,43
+CC701,Cloud Computing,7,A,35
+CC702,Cloud Computing,7,B,34
+AIML701,AI & ML,7,A,38
+AIML702,AI & ML,7,B,36
+CSE401,CSE,4,A,58
+CSE402,CSE,4,B,56
+CC401,Cloud Computing,4,A,40
+CC402,Cloud Computing,4,B,39
+AIML401,AI & ML,4,A,46
+AIML402,AI & ML,4,B,44

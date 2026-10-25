@@ -1,0 +1,9 @@
+
+fastapi
+uvicorn[standard]
+ortools
+sqlalchemy
+pg8000
+python-dotenv
+clerk-backend-api
+alembic

@@ -1,0 +1,16 @@
+faculty_id,faculty_name,max_periods_per_week,max_periods_per_day
+F001,Faculty A,20,5
+F002,Faculty B,20,5
+F003,Faculty C,18,5
+F004,Faculty D,18,5
+F005,Faculty E,20,5
+F006,Faculty F,18,5
+F007,Faculty G,20,5
+F008,Faculty H,18,5
+F009,Faculty I,16,4
+F010,Faculty J,16,4
+F011,Faculty K,18,5
+F012,Faculty L,18,5
+F013,Faculty M,16,4
+F014,Faculty N,16,4
+F015,Faculty O,18,5

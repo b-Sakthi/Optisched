@@ -1,0 +1,12 @@
+room_id,room_name,room_type,capacity
+R101,Classroom 101,Classroom,60
+R102,Classroom 102,Classroom,60
+R103,Classroom 103,Classroom,55
+R104,Classroom 104,Classroom,50
+R105,Classroom 105,Classroom,45
+R106,Classroom 106,Classroom,40
+R201,Computer Lab 1,ComputerLab,60
+R202,Computer Lab 2,ComputerLab,50
+R203,Computer Lab 3,ComputerLab,40
+R301,Project Room 1,ProjectRoom,50
+R302,Project Room 2,ProjectRoom,40

@@ -1,0 +1,26 @@
+subject_id,subject_name,subject_type,periods_per_week,duration_periods,required_room_type
+CS301,Data Structures,Theory,4,1,Classroom
+CS302,Operating Systems,Theory,4,1,Classroom
+CS303,Database Systems,Theory,3,1,Classroom
+CS304,Computer Networks,Theory,3,1,Classroom
+CS305,Operating Systems Lab,Lab,2,2,ComputerLab
+CS306,Mathematics for Computing,Theory,3,1,Classroom
+CS501,Design and Analysis of Algorithms,Theory,4,1,Classroom
+CS502,Computer Architecture,Theory,3,1,Classroom
+CS503,Software Engineering,Theory,3,1,Classroom
+CS504,Cloud Fundamentals,Theory,3,1,Classroom
+CS505,Algorithms Lab,Lab,2,2,ComputerLab
+CC501,Cloud Infrastructure,Theory,4,1,Classroom
+CC502,Cloud Security,Theory,3,1,Classroom
+CC503,Distributed Systems,Theory,3,1,Classroom
+CC504,DevOps Engineering,Theory,3,1,Classroom
+CC505,Cloud Lab,Lab,2,2,ComputerLab
+AI501,Machine Learning,Theory,4,1,Classroom
+AI502,Deep Learning,Theory,3,1,Classroom
+AI503,Data Mining,Theory,3,1,Classroom
+AI504,Computer Vision,Theory,3,1,Classroom
+AI505,AI Lab,Lab,2,2,ComputerLab
+CS701,Cloud Native Applications,Theory,3,1,Classroom
+CS702,Cybersecurity,Theory,3,1,Classroom
+CS703,Project Work,Project,4,1,ProjectRoom
+CS704,Elective,Theory,3,1,Classroom
