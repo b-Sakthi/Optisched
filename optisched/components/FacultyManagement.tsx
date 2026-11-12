@@ -9,16 +9,10 @@ import {
   Edit2,
   Trash2,
   BookOpen,
-  Clock,
-  Shield,
   X,
   Check,
   AlertCircle,
   RefreshCw,
-  Building,
-  Mail,
-  BadgeCheck,
-  Award,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -68,7 +62,6 @@ export function FacultyManagement() {
   // Modal State
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingFaculty, setEditingFaculty] = useState<FacultyMember | null>(null);
-  const [detailsFaculty, setDetailsFaculty] = useState<FacultyMember | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // Form State
@@ -107,7 +100,38 @@ export function FacultyManagement() {
   };
 
   useEffect(() => {
-    void fetchData();
+    let active = true;
+    async function init() {
+      try {
+        const [facRes, subRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/api/faculty`),
+          fetch(`${API_BASE_URL}/api/subjects`),
+        ]);
+
+        if (!facRes.ok) throw new Error(`Failed to load faculty (${facRes.status})`);
+        if (!subRes.ok) throw new Error(`Failed to load subjects (${subRes.status})`);
+
+        const facData: FacultyMember[] = await facRes.json();
+        const subData: Subject[] = await subRes.json();
+
+        if (active) {
+          setFacultyList(facData);
+          setAllSubjects(subData);
+        }
+      } catch (err) {
+        if (active) {
+          setError(err instanceof Error ? err.message : "Error connecting to backend");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    }
+    void init();
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Filtered Faculty List
@@ -414,7 +438,7 @@ export function FacultyManagement() {
           <span className="text-[#8a8f9d]">Workload:</span>
           <select
             value={workloadFilter}
-            onChange={(e) => setWorkloadFilter(e.target.value as any)}
+            onChange={(e) => setWorkloadFilter(e.target.value as "all" | "active" | "unassigned")}
             className="rounded-xl border border-[#e7e9ef] bg-white px-3 py-2 text-xs font-medium text-[#454c80] outline-none"
           >
             <option value="all">All Workloads</option>

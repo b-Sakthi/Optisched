@@ -1,4 +1,4 @@
-import { ApiScheduleEntry, ScheduleEntry } from "./types";
+import { ApiScheduleEntry, ScheduleEntry, User, AuthLoginResponse } from "./types";
 import { toPeriodNumber } from "./utils";
 
 export const API_BASE_URL =
@@ -48,3 +48,33 @@ export async function fetchWithAuth(
     headers,
   });
 }
+
+export async function loginUser(email: string, password: string): Promise<AuthLoginResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Authentication failed");
+  }
+  return res.json();
+}
+
+export async function fetchUsers(): Promise<User[]> {
+  const res = await fetch(`${API_BASE_URL}/api/users`);
+  if (!res.ok) {
+    throw new Error("Failed to fetch users");
+  }
+  return res.json();
+}
+
+export async function fetchUserById(userId: string): Promise<User> {
+  const res = await fetch(`${API_BASE_URL}/api/users/${userId}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch user with ID ${userId}`);
+  }
+  return res.json();
+}
+

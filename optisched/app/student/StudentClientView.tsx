@@ -2,30 +2,24 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  CalendarDays,
   Search,
-  BookOpen,
-  Filter,
   UserCheck,
   ChevronDown,
-  Download,
-  AlertCircle,
-  Building,
+  X,
+  GraduationCap,
 } from "lucide-react";
 import { PortalShell } from "@/components/PortalShell";
 import { TimetableGrid } from "@/components/TimetableGrid";
 import { API_BASE_URL, fetchWithAuth, toUiEntry } from "@/lib/api";
 import { Section, FacultyMember, ScheduleEntry, GenerateResponse } from "@/lib/types";
-import { cn } from "@/lib/utils";
 
 export default function StudentClientView({
   userName,
   userEmail,
-  userRole,
 }: {
   userName: string;
   userEmail: string;
-  userRole: string;
+  userRole?: string;
 }) {
   const [sections, setSections] = useState<Section[]>([]);
   const [selectedSectionId, setSelectedSectionId] = useState("");
@@ -33,48 +27,64 @@ export default function StudentClientView({
   const [selectedFacultyFilter, setSelectedFacultyFilter] = useState("all");
 
   const [schedule, setSchedule] = useState<ScheduleEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [workingHours, setWorkingHours] = useState("09:00-16:00");
+  const [isOfficialPublished, setIsOfficialPublished] = useState(false);
+  const [publishedVersion, setPublishedVersion] = useState<number | null>(null);
 
   useEffect(() => {
+    let active = true;
+
     async function loadData() {
-      setLoading(true);
-      setError("");
       try {
         const [secRes, facRes] = await Promise.all([
           fetchWithAuth(`${API_BASE_URL}/api/sections`),
           fetchWithAuth(`${API_BASE_URL}/api/faculty`),
         ]);
 
-        if (secRes.ok) {
+        if (secRes.ok && active) {
           const secData: Section[] = await secRes.json();
           const activeSecs = secData.filter((s) => s.is_active);
           setSections(activeSecs);
           if (activeSecs.length > 0) {
             setSelectedSectionId(String(activeSecs[0].id));
-            // Fetch published schedule for this section
-            loadTimetable(activeSecs[0].id);
+            void loadTimetable(activeSecs[0].id);
           }
         }
-        if (facRes.ok) {
+        if (facRes.ok && active) {
           const facData: FacultyMember[] = await facRes.json();
           setFacultyList(facData);
         }
-      } catch (e) {
-        setError("Could not connect to university schedule service.");
-      } finally {
-        setLoading(false);
+      } catch {
+        // Silently handled
       }
     }
 
     void loadData();
+    return () => {
+      active = false;
+    };
   }, []);
 
   async function loadTimetable(sectionId: number) {
     try {
-      // In student view, we fetch the schedule for the section
+      // 1. Attempt to load the officially published timetable from permanent database
+      const pubRes = await fetchWithAuth(
+        `${API_BASE_URL}/api/timetable/published/latest?class_id=${sectionId}`
+      );
+      if (pubRes.ok) {
+        const pubData = await pubRes.json();
+        if (pubData.status === "success" && pubData.schedule && pubData.schedule.length > 0) {
+          setSchedule(pubData.schedule.map(toUiEntry));
+          setIsOfficialPublished(true);
+          setPublishedVersion(pubData.version);
+          return;
+        }
+      }
+
+      // 2. Fall back to live solver preview if not yet published
+      setIsOfficialPublished(false);
+      setPublishedVersion(null);
       const res = await fetchWithAuth(
         `${API_BASE_URL}/api/timetable/generate`,
         {
@@ -123,92 +133,117 @@ export default function StudentClientView({
       role="student"
       userName={userName}
       userEmail={userEmail}
-      title="Student Timetable Portal"
+      title="Student Schedule Portal"
+      subtitle="Class schedule, period locations, and instructor details"
       actions={
         <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 rounded-xl border border-[#e7e9ef] px-3 py-1.5 text-xs">
-            <Search size={14} className="text-[#9a9eaa]" />
+          <div className="relative flex items-center">
+            <Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-slate-400" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search subjects or rooms..."
-              className="w-36 bg-transparent outline-none placeholder:text-[#a5a8b2]"
+              placeholder="Filter course or room..."
+              className="h-8 w-36 rounded-md border border-slate-200 bg-white pl-8 pr-7 text-xs text-slate-900 placeholder:text-slate-400 focus:border-slate-900 sm:w-48"
             />
+            {search && (
+              <button
+                onClick={() => setSearch("")}
+                className="absolute right-2 text-slate-400 hover:text-slate-600"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
           </div>
         </div>
       }
     >
       <div className="space-y-6">
-        {/* Controls & Section Selector */}
-        <div className="flex flex-col justify-between gap-4 rounded-2xl border border-[#e8eaf0] bg-white p-5 shadow-sm sm:flex-row sm:items-center">
+        {/* Section Context Header */}
+        <div className="flex flex-col justify-between gap-4 rounded-lg border border-slate-200 bg-white p-5 shadow-xs sm:flex-row sm:items-center">
           <div>
-            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-700">
-              <span className="h-2 w-2 rounded-full bg-emerald-500" />
-              <span>Published Timetable (Read-Only)</span>
+            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-900">
+              <GraduationCap className="h-3.5 w-3.5 text-emerald-700" />
+              <span>Official Academic Timetable</span>
+              {isOfficialPublished ? (
+                <span className="rounded-xs bg-emerald-100 px-1.5 py-0.2 text-[10px] font-bold tracking-wide text-emerald-800 uppercase">
+                  Published v{publishedVersion}
+                </span>
+              ) : (
+                <span className="rounded-xs bg-slate-100 px-1.5 py-0.2 text-[10px] font-medium text-slate-600">
+                  Draft Preview
+                </span>
+              )}
             </div>
-            <h2 className="mt-1 text-xl font-bold tracking-tight text-[#1f2438]">
-              {selectedSection ? `${selectedSection.name} Class Schedule` : "Your Class Schedule"}
+            <h2 className="mt-1 text-xl font-bold tracking-tight text-slate-900">
+              {selectedSection
+                ? `${selectedSection.name} Class Schedule`
+                : "Student Class Schedule"}
             </h2>
-            <p className="mt-0.5 text-xs text-[#8a8f9d]">
+            <p className="mt-0.5 text-xs text-slate-500">
               {selectedSection
                 ? `Department of ${selectedSection.department} · Year ${selectedSection.academic_year} · Semester ${selectedSection.semester}`
-                : "Select your registered academic section below."}
+                : "Select your registered section to view schedule."}
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <label className="flex items-center gap-2 rounded-xl border border-[#e3e5ec] bg-[#f9fafc] px-3 py-2 text-xs">
-              <span className="text-[#999eaa]">My Section:</span>
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            {/* Section Switcher */}
+            <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700">
+              <span className="font-medium text-slate-500">Section:</span>
               <select
                 value={selectedSectionId}
                 onChange={(e) => {
                   const id = e.target.value;
                   setSelectedSectionId(id);
-                  if (id) loadTimetable(Number(id));
+                  if (id) void loadTimetable(Number(id));
                 }}
-                className="bg-transparent font-semibold outline-none"
+                className="bg-transparent font-semibold text-slate-900 outline-none"
               >
                 {sections.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.name} (Sem {s.semester})
+                    {s.name} (Semester {s.semester})
                   </option>
                 ))}
               </select>
-              <ChevronDown size={12} className="text-[#8d92a0]" />
+              <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
             </label>
 
-            {/* Faculty Lookup Filter */}
-            <label className="flex items-center gap-2 rounded-xl border border-[#e3e5ec] bg-[#f9fafc] px-3 py-2 text-xs">
-              <UserCheck size={13} className="text-[#999eaa]" />
+            {/* Faculty Instructor Filter */}
+            <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700">
+              <UserCheck className="h-3.5 w-3.5 text-slate-400" />
               <select
                 value={selectedFacultyFilter}
                 onChange={(e) => setSelectedFacultyFilter(e.target.value)}
-                className="bg-transparent text-xs font-medium outline-none"
+                className="bg-transparent text-xs font-medium text-slate-800 outline-none"
               >
-                <option value="all">All Faculty</option>
+                <option value="all">All Instructors</option>
                 {facultyList.map((f) => (
                   <option key={f.id} value={f.name}>
                     {f.name}
                   </option>
                 ))}
               </select>
-              <ChevronDown size={12} className="text-[#8d92a0]" />
+              <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
             </label>
           </div>
         </div>
 
-        {/* Timetable Grid Viewer */}
+        {/* Timetable Matrix */}
         <TimetableGrid
           schedule={filteredSchedule}
-          title={selectedSection ? `${selectedSection.name} Weekly Timetable` : "Weekly Timetable"}
+          title={
+            selectedSection
+              ? `${selectedSection.name} Weekly Schedule`
+              : "Weekly Schedule"
+          }
           subtitle={
             selectedSection
-              ? `Semester ${selectedSection.semester} · Working Hours: ${workingHours}`
+              ? `Semester ${selectedSection.semester} · Scheduled Hours: ${workingHours}`
               : undefined
           }
           workingHours={workingHours}
           readOnly={true}
-          emptyMessage="No classes scheduled for the selected section."
+          emptyMessage="No classes scheduled for the selected section in the current timetable."
         />
       </div>
     </PortalShell>

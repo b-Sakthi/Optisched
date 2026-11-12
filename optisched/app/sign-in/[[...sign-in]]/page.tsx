@@ -1,146 +1,128 @@
-
 import { Suspense } from "react";
 import { SignIn } from "@clerk/nextjs";
 import Link from "next/link";
+import { CalendarDays, CheckCircle2 } from "lucide-react";
 
-const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+const days = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 
-const slots = [
-  { time: "09:00", subjects: ["DBMS", "Networks", "Algorithms", "OS", "Project Lab"] },
-  { time: "10:00", subjects: ["Algorithms", "DBMS", "Computer Networks", "AI & ML", "Project Lab"] },
-  { time: "11:00", subjects: ["OS", "Compiler Design", "DBMS", "Algorithms", "Elective"] },
-  { time: "12:00", subjects: ["AI & ML", "OS", "Compiler Design", "DBMS", "Elective"] },
-];
-
-const colors = [
-  "bg-blue-100 text-blue-950",
-  "bg-violet-100 text-violet-950",
-  "bg-emerald-100 text-emerald-950",
-  "bg-amber-100 text-amber-950",
-  "bg-rose-100 text-rose-950",
+const previewSlots = [
+  { time: "09:00", subjects: ["CS101", "CS204", "MA102", "CS301", "Lab A"] },
+  { time: "10:00", subjects: ["MA102", "CS101", "CS204", "CS302", "Lab A"] },
+  { time: "11:00", subjects: ["CS301", "MA201", "CS101", "MA102", "CS204"] },
+  { time: "12:00", subjects: ["CS204", "CS301", "MA201", "CS101", "Elective"] },
 ];
 
 export default function SignInPage() {
   return (
-    <main className="min-h-screen bg-white lg:grid lg:grid-cols-[1.1fr_0.9fr]">
-      {/* Product presentation */}
-      <section className="flex flex-col justify-center overflow-hidden bg-[#101b35] px-5 py-10 text-white sm:px-9 lg:min-h-screen lg:px-12 xl:px-16">
-        <Link href="/" className="text-xl font-bold tracking-tight">
-          <span className="mr-2 text-blue-400">▦</span>
-          OptiSched
-        </Link>
-
-        <div className="mx-auto mt-12 w-full max-w-3xl lg:my-auto lg:py-12">
-          <p className="text-sm font-semibold tracking-wide text-blue-300">
-            A BETTER WAY TO SCHEDULE
-          </p>
-
-          <h1 className="mt-4 text-4xl font-bold leading-tight tracking-tight sm:text-5xl">
-            Complex schedules,
-            <span className="block text-blue-400">solved.</span>
-          </h1>
-
-          <p className="mt-5 max-w-lg text-base leading-7 text-slate-300">
-            Organize classes, faculty, rooms, and lab sessions in one
-            constraint-aware timetable workspace.
-          </p>
-
-          {/* Illustrative timetable */}
-          <div className="mt-9 overflow-hidden rounded-xl border border-slate-300 bg-white shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4 sm:px-5">
-              <div>
-                <p className="font-semibold text-slate-900">
-                  Weekly timetable
-                </p>
-                <p className="mt-1 text-xs text-slate-600">
-                  Illustrative product preview
-                </p>
-              </div>
-              <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-700">
-                Sample
-              </span>
+    <main className="min-h-screen bg-slate-50 lg:grid lg:grid-cols-[1.15fr_0.85fr]">
+      {/* Product presentation - Academic Registry */}
+      <section className="flex flex-col justify-between border-b border-slate-800 bg-slate-950 px-6 py-10 text-white sm:px-10 lg:min-h-screen lg:border-b-0 lg:border-r lg:px-14 xl:px-20">
+        <div>
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2.5 text-base font-bold tracking-tight text-white"
+          >
+            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-white">
+              <CalendarDays className="h-4 w-4" />
             </div>
+            <span>OptiSched</span>
+          </Link>
 
-            <div className="overflow-x-auto p-3 sm:p-4">
-              <div className="min-w-[510px]">
-                <div className="grid grid-cols-[54px_repeat(5,minmax(0,1fr))] gap-1.5">
-                  <div />
-                  {days.map((day) => (
-                    <div
-                      key={day}
-                      className="py-2 text-center text-[10px] font-semibold text-slate-600"
-                    >
-                      {day.slice(0, 3).toUpperCase()}
-                    </div>
-                  ))}
+          <div className="mt-16 max-w-xl">
+            <span className="text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
+              University Operations
+            </span>
 
-                  {slots.map((slot, rowIndex) => (
-                    <div key={slot.time} className="contents">
-                      <div className="flex items-center text-xs font-medium text-slate-700">
-                        {slot.time}
+            <h1 className="mt-2 text-3xl font-bold tracking-tight text-white sm:text-4xl lg:text-5xl">
+              Academic Timetable Optimization.
+            </h1>
+
+            <p className="mt-4 text-sm leading-relaxed text-slate-300 sm:text-base">
+              Automated, conflict-free scheduling powered by mathematical constraint
+              satisfaction. Engineered for university administrators, faculty, and students.
+            </p>
+
+            {/* Illustrative Schedule Matrix */}
+            <div className="mt-8 overflow-hidden rounded-lg border border-slate-800 bg-slate-900 shadow-xl">
+              <div className="flex items-center justify-between border-b border-slate-800 bg-slate-900/90 px-4 py-3">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                  <span className="text-xs font-semibold text-slate-200">
+                    Master Timetable Preview
+                  </span>
+                </div>
+                <span className="rounded-xs bg-slate-800 px-2 py-0.5 text-[10px] font-medium text-slate-400 uppercase tracking-wider">
+                  CP-SAT Solved
+                </span>
+              </div>
+
+              <div className="overflow-x-auto p-3">
+                <div className="min-w-[420px]">
+                  <div className="grid grid-cols-[55px_repeat(5,minmax(0,1fr))] gap-1.5 text-center text-xs">
+                    <div />
+                    {days.map((day) => (
+                      <div
+                        key={day}
+                        className="py-1 text-[10px] font-bold text-slate-400 uppercase"
+                      >
+                        {day}
                       </div>
-                      {slot.subjects.map((subject, colIndex) => (
-                        <div
-                          key={`${slot.time}-${colIndex}`}
-                          className={`flex min-h-[64px] items-center justify-center rounded-md p-1.5 text-center text-[10px] font-semibold leading-4 sm:text-xs ${
-                            colors[(rowIndex + colIndex) % colors.length]
-                          }`}
-                        >
-                          {subject}
+                    ))}
+
+                    {previewSlots.map((slot) => (
+                      <div key={slot.time} className="contents">
+                        <div className="flex items-center text-[10px] font-medium text-slate-500 tabular-nums">
+                          {slot.time}
                         </div>
-                      ))}
-                    </div>
-                  ))}
+                        {slot.subjects.map((sub, i) => (
+                          <div
+                            key={`${slot.time}-${i}`}
+                            className="flex min-h-[44px] items-center justify-center rounded-sm border border-slate-800 bg-slate-800/60 p-1 text-[10px] font-semibold text-slate-200"
+                          >
+                            {sub}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <div className="flex items-center gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 sm:px-5">
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-100 font-bold text-blue-800">
-                ✓
-              </span>
-              <div>
-                <p className="text-sm font-semibold text-slate-900">
-                  Constraint-aware scheduling
-                </p>
-                <p className="text-xs leading-5 text-slate-600">
-                  Designed to account for faculty, room, and time constraints.
-                </p>
+              <div className="flex items-center gap-2 border-t border-slate-800 bg-slate-950/70 px-4 py-2.5 text-[11px] text-slate-400">
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                <span>Zero room overlaps · Faculty exclusivity · Verified eligibility</span>
               </div>
             </div>
           </div>
         </div>
 
-        <p className="mt-8 text-xs text-slate-300">
-          Plan better. Make every period count.
-        </p>
+        <div className="mt-12 text-[11px] text-slate-500">
+          <span>OptiSched Operations Platform · Academic Year 2026–2027</span>
+        </div>
       </section>
 
-      {/* Authentication */}
-      <section className="flex items-center justify-center px-5 py-12 sm:px-10 lg:min-h-screen lg:px-12">
-        <div className="w-full max-w-md">
-          <div className="mb-12 flex justify-end">
-            <Link
-              href="/"
-              className="text-sm font-medium text-slate-700 underline-offset-4 hover:text-blue-700 hover:underline"
-            >
-              ← Back to home
-            </Link>
-          </div>
-
+      {/* Authentication Container */}
+      <section className="flex items-center justify-center px-6 py-12 sm:px-10 lg:min-h-screen">
+        <div className="w-full max-w-sm">
           <div className="mb-8">
-            <p className="text-sm font-semibold text-blue-700">
-              YOUR WORKSPACE
-            </p>
-            <h2 className="mt-3 text-3xl font-bold tracking-tight text-[#101b35] sm:text-4xl">
-              Welcome back.
+            <span className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
+              Portal Access
+            </span>
+            <h2 className="mt-1 text-2xl font-bold tracking-tight text-slate-900">
+              Sign In to OptiSched
             </h2>
-            <p className="mt-3 text-base leading-7 text-slate-600">
-              Sign in to access your academic workspace.
+            <p className="mt-1 text-xs text-slate-600">
+              Use your authorized university identity credentials.
             </p>
           </div>
 
-          <Suspense fallback={<div className="p-8 text-center text-sm text-slate-500">Loading sign in...</div>}>
+          <Suspense
+            fallback={
+              <div className="flex h-64 items-center justify-center text-xs text-slate-500">
+                Loading secure sign in...
+              </div>
+            }
+          >
             <SignIn
               routing="path"
               path="/sign-in"
@@ -148,22 +130,24 @@ export default function SignInPage() {
               appearance={{
                 elements: {
                   rootBox: "w-full",
-                  cardBox: "w-full shadow-none",
-                  card: "w-full border-0 shadow-none",
-                  headerTitle: "text-slate-900",
-                  headerSubtitle: "text-slate-600",
-                  formFieldLabel: "font-medium text-slate-800",
-                  formFieldInput: "border-slate-300",
-                  formButtonPrimary: "bg-[#101b35] hover:bg-[#20345b]",
-                  footerActionLink: "font-semibold text-blue-700",
+                  card: "shadow-none border border-slate-200 rounded-lg p-6 bg-white",
+                  headerTitle: "text-base font-bold text-slate-900",
+                  headerSubtitle: "text-xs text-slate-500",
+                  formButtonPrimary:
+                    "bg-slate-900 hover:bg-slate-800 text-xs font-semibold py-2 rounded-md",
+                  formFieldInput:
+                    "rounded-md border-slate-300 text-xs focus:ring-1 focus:ring-slate-900 focus:border-slate-900",
+                  footerActionLink: "text-xs text-slate-900 font-semibold hover:underline",
                 },
               }}
             />
           </Suspense>
 
-          <p className="mt-8 border-t border-slate-200 pt-5 text-center text-xs leading-5 text-slate-600">
-            Your account determines your access permissions.
-          </p>
+          <div className="mt-6 border-t border-slate-200 pt-4 text-center">
+            <p className="text-[11px] text-slate-500">
+              Role permissions are automatically resolved upon sign in.
+            </p>
+          </div>
         </div>
       </section>
     </main>

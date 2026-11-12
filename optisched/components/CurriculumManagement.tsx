@@ -8,7 +8,6 @@ import {
   GraduationCap,
   Layers,
   Plus,
-  Trash2,
   X,
   Search,
   CheckCircle2,
@@ -83,7 +82,38 @@ export function CurriculumManagement() {
   };
 
   useEffect(() => {
-    void loadAll();
+    let active = true;
+    async function init() {
+      try {
+        const [secRes, subRes, roomRes, offRes, facRes] = await Promise.all([
+          fetchWithAuth(`${API_BASE_URL}/api/sections`),
+          fetchWithAuth(`${API_BASE_URL}/api/subjects`),
+          fetchWithAuth(`${API_BASE_URL}/api/rooms`),
+          fetchWithAuth(`${API_BASE_URL}/api/course-offerings`),
+          fetchWithAuth(`${API_BASE_URL}/api/faculty`),
+        ]);
+
+        if (active) {
+          if (secRes.ok) setSections(await secRes.json());
+          if (subRes.ok) setSubjects(await subRes.json());
+          if (roomRes.ok) setRooms(await roomRes.json());
+          if (offRes.ok) setOfferings(await offRes.json());
+          if (facRes.ok) setFaculty(await facRes.json());
+        }
+      } catch (e) {
+        if (active) {
+          setError(e instanceof Error ? e.message : "Error connecting to backend");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    }
+    void init();
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleCreate = async (e: React.FormEvent) => {

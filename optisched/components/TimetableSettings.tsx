@@ -2,7 +2,6 @@
 
 import { useEffect, useState, useMemo } from "react";
 import {
-  Calendar,
   Clock,
   Plus,
   Trash2,
@@ -109,12 +108,14 @@ export function TimetableSettings({
     return originalSnapshot !== "" && originalSnapshot !== currentSnapshot;
   }, [originalSnapshot, currentSnapshot]);
 
-  // Keep selected semester in sync with prop
-  useEffect(() => {
+  // Keep selected semester in sync with prop using React state adjustment
+  const [prevInitial, setPrevInitial] = useState(initialSemester);
+  if (initialSemester !== prevInitial) {
+    setPrevInitial(initialSemester);
     if (initialSemester && initialSemester >= 1 && initialSemester <= 8) {
       setSelectedSemester(initialSemester);
     }
-  }, [initialSemester]);
+  }
 
   // Load configured semesters on mount
   useEffect(() => {
@@ -431,7 +432,7 @@ export function TimetableSettings({
     setBreaks([...breaks, newBrk]);
   }
 
-  function updateBreak(index: number, field: keyof BreakItem, value: any) {
+  function updateBreak(index: number, field: keyof BreakItem, value: string | number | boolean | null | undefined) {
     setBreaks((prev) =>
       prev.map((b, idx) => (idx === index ? { ...b, [field]: value } : b)),
     );
@@ -839,7 +840,7 @@ export function TimetableSettings({
           <div className="space-y-3">
             {breaks.length === 0 ? (
               <p className="py-6 text-center text-xs text-[#a0a4b0]">
-                No breaks configured for Semester {selectedSemester}. Click "+ Add Break" above.
+                No breaks configured for Semester {selectedSemester}. Click &ldquo;+ Add Break&rdquo; above.
               </p>
             ) : (
               breaks.map((b, idx) => (
