@@ -7,3 +7,6 @@ pg8000
 python-dotenv
 clerk-backend-api
 alembic
+bcrypt
+python-ulid
+

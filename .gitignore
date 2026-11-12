@@ -112,3 +112,20 @@ backend/app/core/OptiChurn_Review_II_Final.pptx
 # backend/app/core/University_Course_Timetabling_Literature_Review.pptx (40.7 KB):
 # Presentation document located inside backend application package; not a runtime code dependency.
 backend/app/core/University_Course_Timetabling_Literature_Review.pptx
+
+# ==============================================================================
+# Database Dumps, Backups & Local SQLite Databases
+# ==============================================================================
+backend/backups/
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+
+# ==============================================================================
+# Unrelated / Oversized Dataset & Presentation Files in Sample_Dataset/
+# ==============================================================================
+Sample_Dataset/Videos_MERL_Shopping_Dataset.zip
+Sample_Dataset/Results_MERL_Shopping_Dataset.zip
+Sample_Dataset/INNOST_NANO_2026_Smart_Retail_Poster.pptx
