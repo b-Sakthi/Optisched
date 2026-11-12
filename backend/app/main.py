@@ -1,4 +1,8 @@
 from datetime import datetime
+import csv
+import io
+import re
+import time
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Depends
@@ -9,6 +13,7 @@ from ortools.sat.python import cp_model
 
 from app.db.session import Base, engine, check_database_connection, SessionLocal
 from app.models import (
+    User,
     Faculty,
     ClassSection,
     Subject,
@@ -16,8 +21,14 @@ from app.models import (
     CourseOffering,
     TimetableConfig,
     FacultySubject,
+    FacultyAvailability,
+    PublishedTimetable,
+    PublishedTimetableEntry,
 )
-from app.core.auth import get_current_user
+from app.core.auth import get_current_user, require_admin, require_authenticated
+from app.core.security import verify_password, hash_password
+from app.core.ulid import generate_ulid, is_valid_ulid
+from app.schemas.user import UserCreate, UserResponse
 
 
 # -------------------- Request Schemas --------------------
@@ -26,9 +37,11 @@ class FacultyCreate(BaseModel):
     name: str
     email: EmailStr
     department: str
+    is_active: bool = True
 
 
 class FacultyUpdate(BaseModel):
+    employee_id: str | None = None
     name: str | None = None
     email: EmailStr | None = None
     department: str | None = None
@@ -38,8 +51,19 @@ class FacultyUpdate(BaseModel):
 class SectionCreate(BaseModel):
     name: str
     department: str
-    academic_year: int
-    semester: int
+    academic_year: int = Field(ge=1, le=4)
+    semester: int = Field(ge=1, le=8)
+    student_count: int | None = Field(default=None, ge=1, le=500)
+    is_active: bool = True
+
+
+class SectionUpdate(BaseModel):
+    name: str | None = None
+    department: str | None = None
+    academic_year: int | None = Field(default=None, ge=1, le=4)
+    semester: int | None = Field(default=None, ge=1, le=8)
+    student_count: int | None = Field(default=None, ge=1, le=500)
+    is_active: bool | None = None
 
 
 class SubjectCreate(BaseModel):
@@ -48,11 +72,26 @@ class SubjectCreate(BaseModel):
     department: str
 
 
+class SubjectUpdate(BaseModel):
+    code: str | None = None
+    name: str | None = None
+    department: str | None = None
+
+
 class RoomCreate(BaseModel):
     name: str
     room_type: str
-    capacity: int
+    capacity: int = Field(gt=0)
     building: str | None = None
+    is_active: bool = True
+
+
+class RoomUpdate(BaseModel):
+    name: str | None = None
+    room_type: str | None = None
+    capacity: int | None = Field(default=None, gt=0)
+    building: str | None = None
+    is_active: bool | None = None
 
 
 class CourseOfferingCreate(BaseModel):
@@ -61,6 +100,63 @@ class CourseOfferingCreate(BaseModel):
     faculty_id: int
     weekly_periods: int = Field(ge=1, le=35)
     requires_lab: bool = False
+
+
+class CourseOfferingUpdate(BaseModel):
+    class_id: int | None = None
+    subject_id: int | None = None
+    faculty_id: int | None = None
+    weekly_periods: int | None = Field(default=None, ge=1, le=35)
+    requires_lab: bool | None = None
+
+
+class FacultySubjectCreate(BaseModel):
+    faculty_id: int
+    subject_id: int
+
+
+class FacultyAvailabilityCreate(BaseModel):
+    faculty_id: int
+    day: str
+    start_time: str
+    end_time: str
+    is_available: bool = False
+    reason: str | None = None
+
+
+class FacultyAvailabilityUpdate(BaseModel):
+    day: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    is_available: bool | None = None
+    reason: str | None = None
+
+
+class TimetablePublishRequest(BaseModel):
+    title: str
+    scope: Literal["class", "section", "semester", "department", "university"] = "class"
+    class_id: int | None = None
+    department: str | None = None
+    semester: int | None = None
+    working_hours: str = "09:00-16:00"
+    solver_status: str = "optimal"
+    solve_time_seconds: float | None = None
+    sections_scheduled: int = 1
+    weekly_sessions_scheduled: int = 0
+    schedule: list[dict]
+    validation: dict | None = None
+    notes: list[str] | None = None
+
+
+class CsvImportRequest(BaseModel):
+    entity: Literal["sections", "subjects", "faculty", "faculty_subjects", "rooms", "requirements"]
+    csv_content: str
+    preview_only: bool = True
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 
 # -------------------- Timetable Request Schemas --------------------
@@ -165,6 +261,117 @@ def database_health():
         raise HTTPException(status_code=503, detail="Database connection failed")
 
 
+# -------------------- Authentication & Login APIs --------------------
+@app.post("/api/auth/login")
+def login(credentials: LoginRequest, db: Session = Depends(get_db)):
+    """
+    Authenticates a user using bcrypt password verification against stored password_hash.
+    Never stores or logs plain passwords.
+    """
+    email_clean = str(credentials.email).strip().lower()
+    user = db.query(User).filter(User.email == email_clean).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not verify_password(credentials.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    dashboard_map = {
+        "admin": "/admin",
+        "faculty": "/faculty",
+        "student": "/student",
+    }
+
+    return {
+        "status": "success",
+        "message": f"Successfully authenticated as {user.role}",
+        "user": {
+            "id": user.id,
+            "id_str": str(user.id),
+            "email": user.email,
+            "role": user.role,
+            "name": user.name,
+        },
+        "target_dashboard": dashboard_map.get(user.role, "/student"),
+    }
+
+
+# -------------------- User Management & Retrieval APIs --------------------
+@app.get("/api/users", response_model=list[UserResponse])
+def list_users(db: Session = Depends(get_db)):
+    """
+    Returns all registered users with their 26-character ULIDs.
+    """
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return [
+        UserResponse(
+            id=u.id,
+            id_str=str(u.id),
+            email=u.email,
+            role=u.role,
+            name=u.name,
+            is_active=u.is_active,
+            created_at=u.created_at,
+            updated_at=u.updated_at,
+        )
+        for u in users
+    ]
+
+
+@app.get("/api/users/{user_id}", response_model=UserResponse)
+def get_user(user_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieves a user by their 26-character ULID string.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User with ID '{user_id}' not found")
+    return UserResponse(
+        id=user.id,
+        id_str=str(user.id),
+        email=user.email,
+        role=user.role,
+        name=user.name,
+        is_active=user.is_active,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )
+
+
+@app.post("/api/users", response_model=UserResponse, status_code=201)
+def create_user(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    Creates a new user account with an automatically generated 26-character ULID,
+    storing only bcrypt password hashes.
+    """
+    email_clean = str(user_in.email).strip().lower()
+    existing = db.query(User).filter(User.email == email_clean).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"User with email '{email_clean}' already exists")
+
+    new_user = User(
+        id=generate_ulid(),
+        email=email_clean,
+        password_hash=hash_password(user_in.password),
+        role=user_in.role,
+        name=user_in.name,
+        is_active=user_in.is_active,
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return UserResponse(
+        id=new_user.id,
+        id_str=str(new_user.id),
+        email=new_user.email,
+        role=new_user.role,
+        name=new_user.name,
+        is_active=new_user.is_active,
+        created_at=new_user.created_at,
+        updated_at=new_user.updated_at,
+    )
+
+
 # -------------------- Faculty APIs --------------------
 @app.get("/api/faculty")
 def list_faculty(db: Session = Depends(get_db)):
@@ -247,7 +454,7 @@ def get_faculty(faculty_id: int, db: Session = Depends(get_db)):
 def create_faculty(
     faculty_data: FacultyCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     existing = db.query(Faculty).filter(
         (Faculty.employee_id == faculty_data.employee_id)
@@ -285,7 +492,7 @@ def update_faculty(
     faculty_id: int,
     faculty_data: FacultyUpdate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     faculty = db.query(Faculty).filter(Faculty.id == faculty_id).first()
     if not faculty:
@@ -328,7 +535,7 @@ def update_faculty(
 def delete_faculty(
     faculty_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     faculty = db.query(Faculty).filter(Faculty.id == faculty_id).first()
     if not faculty:
@@ -366,7 +573,7 @@ def assign_faculty_qualification(
     faculty_id: int,
     payload: dict,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     subject_id = payload.get("subject_id")
     if not subject_id:
@@ -408,7 +615,7 @@ def remove_faculty_qualification(
     faculty_id: int,
     subject_id: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     mapping = db.query(FacultySubject).filter(
         FacultySubject.faculty_id == faculty_id,
@@ -445,22 +652,84 @@ def remove_faculty_qualification(
     }
 
 
+# -------------------- Academic Data Overview --------------------
+@app.get("/api/academic-data/overview")
+def get_academic_data_overview(db: Session = Depends(get_db)):
+    sections = db.query(ClassSection).all()
+    subjects = db.query(Subject).all()
+    faculty = db.query(Faculty).all()
+    rooms = db.query(Room).all()
+    mappings = db.query(FacultySubject).all()
+    offerings = db.query(CourseOffering).all()
+
+    classrooms = [r for r in rooms if r.room_type in ("classroom", "lecture_hall")]
+    labs = [r for r in rooms if r.room_type == "lab"]
+    active_faculty = [f for f in faculty if f.is_active]
+    active_sections = [s for s in sections if s.is_active]
+
+    # Calculate system readiness for timetable generation
+    missing_requirements = []
+    if not active_sections:
+        missing_requirements.append("At least 1 active class section is required.")
+    if not subjects:
+        missing_requirements.append("At least 1 subject is required.")
+    if not active_faculty:
+        missing_requirements.append("At least 1 active faculty member is required.")
+    if not classrooms:
+        missing_requirements.append("At least 1 classroom is required.")
+    if not offerings:
+        missing_requirements.append("At least 1 course requirement/offering is required.")
+
+    # Distinct departments
+    departments = sorted(list(set(
+        [s.department for s in sections if s.department] +
+        [sub.department for sub in subjects if sub.department] +
+        [f.department for f in faculty if f.department]
+    )))
+
+    return {
+        "sections_count": len(sections),
+        "active_sections_count": len(active_sections),
+        "subjects_count": len(subjects),
+        "faculty_count": len(faculty),
+        "active_faculty_count": len(active_faculty),
+        "rooms_count": len(rooms),
+        "classrooms_count": len(classrooms),
+        "labs_count": len(labs),
+        "qualifications_count": len(mappings),
+        "offerings_count": len(offerings),
+        "departments": departments,
+        "ready_for_scheduling": len(missing_requirements) == 0,
+        "readiness_details": missing_requirements if missing_requirements else ["All core prerequisites configured for timetable optimization."],
+    }
+
+
 # -------------------- Student Section APIs --------------------
 @app.post("/api/sections", status_code=201)
 def create_section(
     section_data: SectionCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
+    name_clean = section_data.name.strip()
+    dept_clean = section_data.department.strip()
+    if not name_clean:
+        raise HTTPException(status_code=400, detail="Section name cannot be empty")
+    if not dept_clean:
+        raise HTTPException(status_code=400, detail="Department cannot be empty")
     if not 1 <= section_data.semester <= 8:
         raise HTTPException(status_code=400, detail="Semester must be between 1 and 8")
     if not 1 <= section_data.academic_year <= 4:
         raise HTTPException(status_code=400, detail="Academic year must be between 1 and 4")
-    if db.query(ClassSection).filter(ClassSection.name == section_data.name).first():
-        raise HTTPException(status_code=409, detail="Section name already exists")
+    if section_data.student_count is not None and section_data.student_count < 1:
+        raise HTTPException(status_code=400, detail="Student count must be a positive integer")
+    if db.query(ClassSection).filter(ClassSection.name == name_clean).first():
+        raise HTTPException(status_code=409, detail=f"Section name '{name_clean}' already exists")
     section = ClassSection(
-        name=section_data.name, department=section_data.department,
+        name=name_clean, department=dept_clean,
         academic_year=section_data.academic_year, semester=section_data.semester,
+        student_count=section_data.student_count,
+        is_active=section_data.is_active,
     )
     try:
         db.add(section)
@@ -473,6 +742,7 @@ def create_section(
         "message": "Section created successfully", "id": section.id,
         "name": section.name, "department": section.department,
         "academic_year": section.academic_year, "semester": section.semester,
+        "student_count": section.student_count,
         "is_active": section.is_active,
     }
 
@@ -480,14 +750,127 @@ def create_section(
 @app.get("/api/sections")
 def list_sections(db: Session = Depends(get_db)):
     sections = db.query(ClassSection).order_by(ClassSection.semester, ClassSection.name).all()
+    offerings = db.query(CourseOffering).all()
+    off_counts: dict[int, int] = {}
+    for o in offerings:
+        off_counts[o.class_id] = off_counts.get(o.class_id, 0) + 1
+
     return [
         {
             "id": s.id, "name": s.name, "department": s.department,
             "academic_year": s.academic_year, "semester": s.semester,
+            "student_count": getattr(s, "student_count", None),
             "is_active": s.is_active,
+            "offerings_count": off_counts.get(s.id, 0),
         }
         for s in sections
     ]
+
+
+@app.get("/api/sections/{section_id}")
+def get_section(section_id: int, db: Session = Depends(get_db)):
+    sec = db.query(ClassSection).filter(ClassSection.id == section_id).first()
+    if not sec:
+        raise HTTPException(status_code=404, detail="Section not found")
+    offerings = db.query(CourseOffering).filter(CourseOffering.class_id == section_id).all()
+    return {
+        "id": sec.id,
+        "name": sec.name,
+        "department": sec.department,
+        "academic_year": sec.academic_year,
+        "semester": sec.semester,
+        "student_count": getattr(sec, "student_count", None),
+        "is_active": sec.is_active,
+        "offerings_count": len(offerings),
+    }
+
+
+@app.put("/api/sections/{section_id}")
+def update_section(
+    section_id: int,
+    section_data: SectionUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    sec = db.query(ClassSection).filter(ClassSection.id == section_id).first()
+    if not sec:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    if section_data.name is not None:
+        name_clean = section_data.name.strip()
+        if not name_clean:
+            raise HTTPException(status_code=400, detail="Section name cannot be empty")
+        if name_clean != sec.name:
+            if db.query(ClassSection).filter(ClassSection.name == name_clean, ClassSection.id != section_id).first():
+                raise HTTPException(status_code=409, detail=f"Section name '{name_clean}' already in use")
+            sec.name = name_clean
+
+    if section_data.department is not None:
+        dept_clean = section_data.department.strip()
+        if not dept_clean:
+            raise HTTPException(status_code=400, detail="Department cannot be empty")
+        sec.department = dept_clean
+
+    if section_data.academic_year is not None:
+        sec.academic_year = section_data.academic_year
+    if section_data.semester is not None:
+        sec.semester = section_data.semester
+    if section_data.student_count is not None:
+        if section_data.student_count < 1:
+            raise HTTPException(status_code=400, detail="Student count must be a positive integer")
+        sec.student_count = section_data.student_count
+    if section_data.is_active is not None:
+        sec.is_active = section_data.is_active
+
+    try:
+        db.commit()
+        db.refresh(sec)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not update section")
+
+    return {
+        "message": "Section updated successfully",
+        "id": sec.id,
+        "name": sec.name,
+        "department": sec.department,
+        "academic_year": sec.academic_year,
+        "semester": sec.semester,
+        "student_count": getattr(sec, "student_count", 60) or 60,
+        "is_active": sec.is_active,
+    }
+
+
+@app.delete("/api/sections/{section_id}")
+def delete_section(
+    section_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    sec = db.query(ClassSection).filter(ClassSection.id == section_id).first()
+    if not sec:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    # Safeguard: prevent accidental deletion of records referenced by course requirements
+    active_offerings = db.query(CourseOffering).filter(CourseOffering.class_id == section_id).all()
+    if active_offerings:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete section '{sec.name}': currently referenced by "
+                f"{len(active_offerings)} course requirement(s). "
+                f"Remove or reassign the course requirements before deleting this section."
+            ),
+        )
+
+    try:
+        db.delete(sec)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete section")
+
+    return {"message": f"Section '{sec.name}' deleted successfully", "id": section_id}
 
 
 # -------------------- Subject APIs --------------------
@@ -495,13 +878,22 @@ def list_sections(db: Session = Depends(get_db)):
 def create_subject(
     subject_data: SubjectCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
-    if db.query(Subject).filter(Subject.code == subject_data.code).first():
-        raise HTTPException(status_code=409, detail="Subject code already exists")
-    subject = Subject(
-        code=subject_data.code, name=subject_data.name, department=subject_data.department,
-    )
+    code_clean = subject_data.code.strip().upper()
+    name_clean = subject_data.name.strip()
+    dept_clean = subject_data.department.strip()
+
+    if not code_clean:
+        raise HTTPException(status_code=400, detail="Subject code cannot be empty")
+    if not name_clean:
+        raise HTTPException(status_code=400, detail="Subject name cannot be empty")
+    if not dept_clean:
+        raise HTTPException(status_code=400, detail="Department cannot be empty")
+
+    if db.query(Subject).filter(Subject.code == code_clean).first():
+        raise HTTPException(status_code=409, detail=f"Subject code '{code_clean}' already exists")
+    subject = Subject(code=code_clean, name=name_clean, department=dept_clean)
     try:
         db.add(subject)
         db.commit()
@@ -518,10 +910,129 @@ def create_subject(
 @app.get("/api/subjects")
 def list_subjects(db: Session = Depends(get_db)):
     subjects = db.query(Subject).order_by(Subject.code).all()
+    mappings = db.query(FacultySubject).all()
+    offerings = db.query(CourseOffering).all()
+
+    qual_count: dict[int, int] = {}
+    for m in mappings:
+        qual_count[m.subject_id] = qual_count.get(m.subject_id, 0) + 1
+
+    off_count: dict[int, int] = {}
+    for o in offerings:
+        off_count[o.subject_id] = off_count.get(o.subject_id, 0) + 1
+
     return [
-        {"id": s.id, "code": s.code, "name": s.name, "department": s.department}
+        {
+            "id": s.id,
+            "code": s.code,
+            "name": s.name,
+            "department": s.department,
+            "qualifications_count": qual_count.get(s.id, 0),
+            "offerings_count": off_count.get(s.id, 0),
+        }
         for s in subjects
     ]
+
+
+@app.get("/api/subjects/{subject_id}")
+def get_subject(subject_id: int, db: Session = Depends(get_db)):
+    sub = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    mappings = db.query(FacultySubject).filter(FacultySubject.subject_id == subject_id).all()
+    offerings = db.query(CourseOffering).filter(CourseOffering.subject_id == subject_id).all()
+
+    return {
+        "id": sub.id,
+        "code": sub.code,
+        "name": sub.name,
+        "department": sub.department,
+        "qualifications_count": len(mappings),
+        "offerings_count": len(offerings),
+    }
+
+
+@app.put("/api/subjects/{subject_id}")
+def update_subject(
+    subject_id: int,
+    subject_data: SubjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    sub = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    if subject_data.code is not None:
+        code_clean = subject_data.code.strip().upper()
+        if not code_clean:
+            raise HTTPException(status_code=400, detail="Subject code cannot be empty")
+        if code_clean != sub.code:
+            if db.query(Subject).filter(Subject.code == code_clean, Subject.id != subject_id).first():
+                raise HTTPException(status_code=409, detail=f"Subject code '{code_clean}' already in use")
+            sub.code = code_clean
+
+    if subject_data.name is not None:
+        name_clean = subject_data.name.strip()
+        if not name_clean:
+            raise HTTPException(status_code=400, detail="Subject name cannot be empty")
+        sub.name = name_clean
+
+    if subject_data.department is not None:
+        dept_clean = subject_data.department.strip()
+        if not dept_clean:
+            raise HTTPException(status_code=400, detail="Department cannot be empty")
+        sub.department = dept_clean
+
+    try:
+        db.commit()
+        db.refresh(sub)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not update subject")
+
+    return {
+        "message": "Subject updated successfully",
+        "id": sub.id,
+        "code": sub.code,
+        "name": sub.name,
+        "department": sub.department,
+    }
+
+
+@app.delete("/api/subjects/{subject_id}")
+def delete_subject(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    sub = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    # Safeguard: prevent accidental deletion if referenced by course requirements
+    active_offerings = db.query(CourseOffering).filter(CourseOffering.subject_id == subject_id).all()
+    if active_offerings:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete subject '{sub.code}': currently referenced by "
+                f"{len(active_offerings)} course requirement(s). "
+                f"Remove or reassign the course requirements before deleting this subject."
+            ),
+        )
+
+    try:
+        # Delete associated qualification mappings first
+        db.query(FacultySubject).filter(FacultySubject.subject_id == subject_id).delete()
+        db.delete(sub)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete subject")
+
+    return {"message": f"Subject '{sub.code}' deleted successfully", "id": subject_id}
 
 
 # -------------------- Rooms APIs --------------------
@@ -529,20 +1040,29 @@ def list_subjects(db: Session = Depends(get_db)):
 def create_room(
     room_data: RoomCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
+    name_clean = room_data.name.strip()
+    if not name_clean:
+        raise HTTPException(status_code=400, detail="Room name cannot be empty")
     if room_data.capacity <= 0:
         raise HTTPException(status_code=400, detail="Room capacity must be greater than zero")
-    if room_data.room_type not in {"classroom", "lab", "lecture_hall"}:
+    norm_type = room_data.room_type.strip().lower()
+    if norm_type in ("classroom", "lecture_hall", "lecture"):
+        norm_type = "classroom"
+    elif norm_type in ("lab", "laboratory"):
+        norm_type = "lab"
+    else:
         raise HTTPException(
             status_code=400,
-            detail="Room type must be classroom, lab, or lecture_hall",
+            detail="Room type must be classroom or lab",
         )
-    if db.query(Room).filter(Room.name == room_data.name).first():
-        raise HTTPException(status_code=409, detail="Room name already exists")
+    if db.query(Room).filter(Room.name == name_clean).first():
+        raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists")
     room = Room(
-        name=room_data.name, room_type=room_data.room_type,
-        capacity=room_data.capacity, building=room_data.building,
+        name=name_clean, room_type=norm_type,
+        capacity=room_data.capacity, building=room_data.building.strip() if room_data.building else None,
+        is_active=room_data.is_active,
     )
     try:
         db.add(room)
@@ -570,12 +1090,160 @@ def list_rooms(db: Session = Depends(get_db)):
     ]
 
 
+@app.get("/api/rooms/{room_id}")
+def get_room(room_id: int, db: Session = Depends(get_db)):
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {
+        "id": room.id, "name": room.name, "room_type": room.room_type,
+        "capacity": room.capacity, "building": room.building, "is_active": room.is_active,
+    }
+
+
+@app.put("/api/rooms/{room_id}")
+def update_room(
+    room_id: int,
+    room_data: RoomUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    if room_data.name is not None:
+        name_clean = room_data.name.strip()
+        if not name_clean:
+            raise HTTPException(status_code=400, detail="Room name cannot be empty")
+        if name_clean != room.name:
+            if db.query(Room).filter(Room.name == name_clean, Room.id != room_id).first():
+                raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists")
+            room.name = name_clean
+
+    if room_data.room_type is not None:
+        norm_type = room_data.room_type.strip().lower()
+        if norm_type in ("classroom", "lecture_hall", "lecture"):
+            norm_type = "classroom"
+        elif norm_type in ("lab", "laboratory"):
+            norm_type = "lab"
+        else:
+            raise HTTPException(status_code=400, detail="Room type must be classroom or lab")
+        room.room_type = norm_type
+
+    if room_data.capacity is not None:
+        if room_data.capacity <= 0:
+            raise HTTPException(status_code=400, detail="Room capacity must be greater than zero")
+        room.capacity = room_data.capacity
+
+    if room_data.building is not None:
+        room.building = room_data.building.strip() or None
+
+    if room_data.is_active is not None:
+        room.is_active = room_data.is_active
+
+    try:
+        db.commit()
+        db.refresh(room)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not update room")
+
+    return {
+        "message": "Room updated successfully",
+        "id": room.id,
+        "name": room.name,
+        "room_type": room.room_type,
+        "capacity": room.capacity,
+        "building": room.building,
+        "is_active": room.is_active,
+    }
+
+
+@app.delete("/api/rooms/{room_id}")
+def delete_room(
+    room_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    try:
+        db.delete(room)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete room")
+
+    return {"message": f"Room '{room.name}' deleted successfully", "id": room_id}
+
+
+@app.get("/api/rooms/{room_id}/schedule")
+def get_room_schedule(room_id: int, db: Session = Depends(get_db)):
+    room = db.query(Room).filter(Room.id == room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    entries = (
+        db.query(PublishedTimetableEntry)
+        .join(PublishedTimetable, PublishedTimetableEntry.timetable_id == PublishedTimetable.id)
+        .filter(
+            PublishedTimetableEntry.room_id == room_id,
+            PublishedTimetable.is_active.is_(True),
+        )
+        .all()
+    )
+
+    schedule = [
+        {
+            "id": e.id,
+            "day": e.day,
+            "period": e.period,
+            "start_time": e.start_time,
+            "end_time": e.end_time,
+            "class_id": e.class_id,
+            "class_name": e.class_name,
+            "department": e.department,
+            "semester": e.semester,
+            "subject_id": e.subject_id,
+            "subject_code": e.subject_code,
+            "subject_name": e.subject_name,
+            "faculty_id": e.faculty_id,
+            "faculty_name": e.faculty_name,
+            "room_id": e.room_id,
+            "room_name": e.room_name,
+            "room_type": e.room_type,
+            "occurrence": e.occurrence,
+        }
+        for e in entries
+    ]
+
+    day_rank = {day: i for i, day in enumerate(VALID_DAYS)}
+    schedule.sort(key=lambda row: (
+        day_rank.get(row["day"], 99),
+        _to_minutes(row["start_time"]),
+    ))
+
+    return {
+        "room_id": room.id,
+        "room_name": room.name,
+        "room_type": room.room_type,
+        "capacity": room.capacity,
+        "building": room.building,
+        "is_active": room.is_active,
+        "scheduled_sessions_count": len(schedule),
+        "schedule": schedule,
+    }
+
+
 # -------------------- Course Offerings APIs --------------------
 @app.post("/api/course-offerings", status_code=201)
 def create_course_offering(
     offering_data: CourseOfferingCreate,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     if offering_data.weekly_periods < 1:
         raise HTTPException(status_code=400, detail="Weekly periods must be at least 1")
@@ -585,18 +1253,36 @@ def create_course_offering(
     ).first()
     if not section:
         raise HTTPException(status_code=404, detail="Active class section not found")
-    if not db.query(Subject).filter(Subject.id == offering_data.subject_id).first():
+    subject = db.query(Subject).filter(Subject.id == offering_data.subject_id).first()
+    if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
     faculty = db.query(Faculty).filter(
         Faculty.id == offering_data.faculty_id, Faculty.is_active.is_(True),
     ).first()
     if not faculty:
         raise HTTPException(status_code=404, detail="Active faculty member not found")
+
     if db.query(CourseOffering).filter(
         CourseOffering.class_id == offering_data.class_id,
         CourseOffering.subject_id == offering_data.subject_id,
     ).first():
-        raise HTTPException(status_code=409, detail="This subject is already assigned to the class")
+        raise HTTPException(status_code=409, detail=f"Subject '{subject.code}' is already assigned to section '{section.name}'")
+
+    # Faculty-Subject Qualification Validation:
+    # If qualifications exist in the system for this subject, verify this faculty has the qualification
+    subject_quals = db.query(FacultySubject).filter(FacultySubject.subject_id == offering_data.subject_id).all()
+    if subject_quals:
+        qualified_fac_ids = {q.faculty_id for q in subject_quals}
+        if offering_data.faculty_id not in qualified_fac_ids:
+            qualified_names = [f.name for f in db.query(Faculty).filter(Faculty.id.in_(qualified_fac_ids)).all()]
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Faculty '{faculty.name}' is not qualified to teach subject '{subject.code}: {subject.name}'. "
+                    f"Qualified faculty: {', '.join(qualified_names) if qualified_names else 'None registered'}. "
+                    f"Please map this faculty member to the subject first in Faculty-Subject Mappings."
+                ),
+            )
 
     offering = CourseOffering(
         class_id=offering_data.class_id, subject_id=offering_data.subject_id,
@@ -615,6 +1301,10 @@ def create_course_offering(
         "class_id": offering.class_id, "subject_id": offering.subject_id,
         "faculty_id": offering.faculty_id, "weekly_periods": offering.weekly_periods,
         "requires_lab": offering.requires_lab,
+        "class_name": section.name,
+        "subject_code": subject.code,
+        "subject_name": subject.name,
+        "faculty_name": faculty.name,
     }
 
 
@@ -623,14 +1313,148 @@ def list_course_offerings(db: Session = Depends(get_db)):
     offerings = db.query(CourseOffering).order_by(
         CourseOffering.class_id, CourseOffering.subject_id,
     ).all()
+
+    sections_map = {s.id: s for s in db.query(ClassSection).all()}
+    subjects_map = {s.id: s for s in db.query(Subject).all()}
+    faculty_map = {f.id: f for f in db.query(Faculty).all()}
+
     return [
         {
-            "id": o.id, "class_id": o.class_id, "subject_id": o.subject_id,
-            "faculty_id": o.faculty_id, "weekly_periods": o.weekly_periods,
+            "id": o.id,
+            "class_id": o.class_id,
+            "class_name": sections_map.get(o.class_id).name if o.class_id in sections_map else f"Section {o.class_id}",
+            "department": sections_map.get(o.class_id).department if o.class_id in sections_map else "Unknown",
+            "semester": sections_map.get(o.class_id).semester if o.class_id in sections_map else 1,
+            "subject_id": o.subject_id,
+            "subject_code": subjects_map.get(o.subject_id).code if o.subject_id in subjects_map else f"SUBJ-{o.subject_id}",
+            "subject_name": subjects_map.get(o.subject_id).name if o.subject_id in subjects_map else "Unknown",
+            "faculty_id": o.faculty_id,
+            "faculty_name": faculty_map.get(o.faculty_id).name if o.faculty_id in faculty_map else f"Faculty {o.faculty_id}",
+            "weekly_periods": o.weekly_periods,
             "requires_lab": o.requires_lab,
         }
         for o in offerings
     ]
+
+
+@app.get("/api/course-offerings/{offering_id}")
+def get_course_offering(offering_id: int, db: Session = Depends(get_db)):
+    off = db.query(CourseOffering).filter(CourseOffering.id == offering_id).first()
+    if not off:
+        raise HTTPException(status_code=404, detail="Course offering not found")
+
+    sec = db.query(ClassSection).filter(ClassSection.id == off.class_id).first()
+    sub = db.query(Subject).filter(Subject.id == off.subject_id).first()
+    fac = db.query(Faculty).filter(Faculty.id == off.faculty_id).first()
+
+    return {
+        "id": off.id,
+        "class_id": off.class_id,
+        "class_name": sec.name if sec else "Unknown",
+        "subject_id": off.subject_id,
+        "subject_code": sub.code if sub else "Unknown",
+        "subject_name": sub.name if sub else "Unknown",
+        "faculty_id": off.faculty_id,
+        "faculty_name": fac.name if fac else "Unknown",
+        "weekly_periods": off.weekly_periods,
+        "requires_lab": off.requires_lab,
+    }
+
+
+@app.put("/api/course-offerings/{offering_id}")
+def update_course_offering(
+    offering_id: int,
+    offering_data: CourseOfferingUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    off = db.query(CourseOffering).filter(CourseOffering.id == offering_id).first()
+    if not off:
+        raise HTTPException(status_code=404, detail="Course offering not found")
+
+    target_class_id = offering_data.class_id if offering_data.class_id is not None else off.class_id
+    target_subject_id = offering_data.subject_id if offering_data.subject_id is not None else off.subject_id
+    target_faculty_id = offering_data.faculty_id if offering_data.faculty_id is not None else off.faculty_id
+
+    # Validate section exists and is active
+    sec = db.query(ClassSection).filter(ClassSection.id == target_class_id).first()
+    if not sec or not sec.is_active:
+        raise HTTPException(status_code=404, detail="Target active class section not found")
+
+    # Validate subject exists
+    sub = db.query(Subject).filter(Subject.id == target_subject_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Target subject not found")
+
+    # Validate faculty exists and is active
+    fac = db.query(Faculty).filter(Faculty.id == target_faculty_id).first()
+    if not fac or not fac.is_active:
+        raise HTTPException(status_code=404, detail="Target active faculty member not found")
+
+    # Check pair uniqueness if class or subject changed
+    if (target_class_id != off.class_id or target_subject_id != off.subject_id):
+        existing_pair = db.query(CourseOffering).filter(
+            CourseOffering.class_id == target_class_id,
+            CourseOffering.subject_id == target_subject_id,
+            CourseOffering.id != offering_id,
+        ).first()
+        if existing_pair:
+            raise HTTPException(status_code=409, detail=f"Subject '{sub.code}' is already assigned to section '{sec.name}'")
+
+    # Check qualification
+    subject_quals = db.query(FacultySubject).filter(FacultySubject.subject_id == target_subject_id).all()
+    if subject_quals:
+        qualified_fac_ids = {q.faculty_id for q in subject_quals}
+        if target_faculty_id not in qualified_fac_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Faculty '{fac.name}' is not qualified to teach subject '{sub.code}: {sub.name}'.",
+            )
+
+    off.class_id = target_class_id
+    off.subject_id = target_subject_id
+    off.faculty_id = target_faculty_id
+    if offering_data.weekly_periods is not None:
+        off.weekly_periods = offering_data.weekly_periods
+    if offering_data.requires_lab is not None:
+        off.requires_lab = offering_data.requires_lab
+
+    try:
+        db.commit()
+        db.refresh(off)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not update course offering")
+
+    return {
+        "message": "Course offering updated successfully",
+        "id": off.id,
+        "class_id": off.class_id,
+        "subject_id": off.subject_id,
+        "faculty_id": off.faculty_id,
+        "weekly_periods": off.weekly_periods,
+        "requires_lab": off.requires_lab,
+    }
+
+
+@app.delete("/api/course-offerings/{offering_id}")
+def delete_course_offering(
+    offering_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    off = db.query(CourseOffering).filter(CourseOffering.id == offering_id).first()
+    if not off:
+        raise HTTPException(status_code=404, detail="Course offering not found")
+
+    try:
+        db.delete(off)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete course offering")
+
+    return {"message": "Course offering deleted successfully", "id": offering_id}
 
 
 # -------------------- OR-Tools Timetable Generation --------------------
@@ -879,7 +1703,7 @@ def save_timetable_configuration(
     semester: int,
     data: TimetableConfigSave,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     if not 1 <= semester <= 8:
         raise HTTPException(status_code=400, detail="Semester must be between 1 and 8.")
@@ -964,7 +1788,7 @@ def save_timetable_configuration(
 def delete_timetable_configuration(
     semester: int,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     if not 1 <= semester <= 8:
         raise HTTPException(status_code=400, detail="Semester must be between 1 and 8.")
@@ -1000,14 +1824,836 @@ def delete_timetable_configuration(
 @app.get("/api/faculty-subjects")
 def list_faculty_subjects(db: Session = Depends(get_db)):
     mappings = db.query(FacultySubject).all()
+    faculty_map = {f.id: f for f in db.query(Faculty).all()}
+    subject_map = {s.id: s for s in db.query(Subject).all()}
+
     return [
         {
             "id": m.id,
             "faculty_id": m.faculty_id,
             "subject_id": m.subject_id,
+            "faculty_name": faculty_map.get(m.faculty_id).name if m.faculty_id in faculty_map else f"Faculty {m.faculty_id}",
+            "employee_id": faculty_map.get(m.faculty_id).employee_id if m.faculty_id in faculty_map else "",
+            "subject_code": subject_map.get(m.subject_id).code if m.subject_id in subject_map else f"SUBJ-{m.subject_id}",
+            "subject_name": subject_map.get(m.subject_id).name if m.subject_id in subject_map else "",
         }
         for m in mappings
     ]
+
+
+@app.post("/api/faculty-subjects", status_code=201)
+def create_faculty_subject(
+    payload: FacultySubjectCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    faculty = db.query(Faculty).filter(Faculty.id == payload.faculty_id).first()
+    if not faculty:
+        raise HTTPException(status_code=404, detail="Faculty member not found")
+    subject = db.query(Subject).filter(Subject.id == payload.subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    existing = db.query(FacultySubject).filter(
+        FacultySubject.faculty_id == payload.faculty_id,
+        FacultySubject.subject_id == payload.subject_id,
+    ).first()
+    if existing:
+        return {
+            "message": "Faculty qualification already exists",
+            "id": existing.id,
+            "faculty_id": existing.faculty_id,
+            "subject_id": existing.subject_id,
+            "faculty_name": faculty.name,
+            "subject_code": subject.code,
+            "subject_name": subject.name,
+        }
+
+    mapping = FacultySubject(faculty_id=payload.faculty_id, subject_id=payload.subject_id)
+    try:
+        db.add(mapping)
+        db.commit()
+        db.refresh(mapping)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not assign qualification")
+
+    return {
+        "message": f"Mapped '{subject.name}' to '{faculty.name}' successfully",
+        "id": mapping.id,
+        "faculty_id": mapping.faculty_id,
+        "subject_id": mapping.subject_id,
+        "faculty_name": faculty.name,
+        "subject_code": subject.code,
+        "subject_name": subject.name,
+    }
+
+
+@app.delete("/api/faculty-subjects/{mapping_id}")
+def delete_faculty_subject_by_id(
+    mapping_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    mapping = db.query(FacultySubject).filter(FacultySubject.id == mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Qualification mapping not found")
+
+    # Safeguard: prevent removing qualification if faculty is actively teaching this subject
+    active_offering = db.query(CourseOffering).filter(
+        CourseOffering.faculty_id == mapping.faculty_id,
+        CourseOffering.subject_id == mapping.subject_id,
+    ).first()
+    if active_offering:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot remove qualification: faculty member is actively assigned to teach this "
+                "subject in an active course offering. Reassign or delete the offering first."
+            ),
+        )
+
+    try:
+        db.delete(mapping)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete qualification mapping")
+
+    return {"message": "Qualification mapping removed successfully", "id": mapping_id}
+
+
+# -------------------- Faculty Availability APIs --------------------
+@app.get("/api/faculty-availability")
+def list_faculty_availability(
+    faculty_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(FacultyAvailability)
+    if faculty_id is not None:
+        query = query.filter(FacultyAvailability.faculty_id == faculty_id)
+    records = query.all()
+
+    faculty_map = {f.id: f for f in db.query(Faculty).all()}
+    day_rank = {day: i for i, day in enumerate(VALID_DAYS)}
+
+    result = [
+        {
+            "id": r.id,
+            "faculty_id": r.faculty_id,
+            "faculty_name": faculty_map.get(r.faculty_id).name if r.faculty_id in faculty_map else "Unknown",
+            "employee_id": faculty_map.get(r.faculty_id).employee_id if r.faculty_id in faculty_map else "",
+            "day": r.day,
+            "start_time": r.start_time,
+            "end_time": r.end_time,
+            "is_available": r.is_available,
+            "reason": r.reason,
+        }
+        for r in records
+    ]
+    result.sort(key=lambda x: (
+        day_rank.get(x["day"], 99),
+        _to_minutes(x["start_time"]),
+    ))
+    return result
+
+
+@app.get("/api/faculty/{faculty_id}/availability")
+def get_faculty_availability(
+    faculty_id: int,
+    db: Session = Depends(get_db),
+):
+    faculty = db.query(Faculty).filter(Faculty.id == faculty_id).first()
+    if not faculty:
+        raise HTTPException(status_code=404, detail="Faculty member not found")
+
+    records = db.query(FacultyAvailability).filter(FacultyAvailability.faculty_id == faculty_id).all()
+    day_rank = {day: i for i, day in enumerate(VALID_DAYS)}
+
+    result = [
+        {
+            "id": r.id,
+            "faculty_id": r.faculty_id,
+            "faculty_name": faculty.name,
+            "employee_id": faculty.employee_id,
+            "day": r.day,
+            "start_time": r.start_time,
+            "end_time": r.end_time,
+            "is_available": r.is_available,
+            "reason": r.reason,
+        }
+        for r in records
+    ]
+    result.sort(key=lambda x: (
+        day_rank.get(x["day"], 99),
+        _to_minutes(x["start_time"]),
+    ))
+    return result
+
+
+@app.post("/api/faculty-availability", status_code=201)
+def create_faculty_availability(
+    payload: FacultyAvailabilityCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    faculty = db.query(Faculty).filter(Faculty.id == payload.faculty_id).first()
+    if not faculty:
+        raise HTTPException(status_code=404, detail="Faculty member not found")
+
+    day_clean = payload.day.strip().capitalize()
+    if day_clean not in VALID_DAYS:
+        raise HTTPException(status_code=400, detail=f"Invalid day '{payload.day}'. Valid days: {', '.join(VALID_DAYS)}")
+
+    try:
+        t_start = _to_minutes(payload.start_time)
+        t_end = _to_minutes(payload.end_time)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM format.")
+
+    if t_start >= t_end:
+        raise HTTPException(status_code=400, detail="start_time must be strictly earlier than end_time")
+
+    record = FacultyAvailability(
+        faculty_id=payload.faculty_id,
+        day=day_clean,
+        start_time=payload.start_time.strip(),
+        end_time=payload.end_time.strip(),
+        is_available=payload.is_available,
+        reason=payload.reason.strip() if payload.reason else None,
+    )
+    try:
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not save faculty availability")
+
+    return {
+        "message": f"Availability block for '{faculty.name}' on {record.day} saved successfully",
+        "id": record.id,
+        "faculty_id": record.faculty_id,
+        "faculty_name": faculty.name,
+        "day": record.day,
+        "start_time": record.start_time,
+        "end_time": record.end_time,
+        "is_available": record.is_available,
+        "reason": record.reason,
+    }
+
+
+@app.delete("/api/faculty-availability/{availability_id}")
+def delete_faculty_availability(
+    availability_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    record = db.query(FacultyAvailability).filter(FacultyAvailability.id == availability_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Faculty availability record not found")
+
+    try:
+        db.delete(record)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not delete faculty availability record")
+
+    return {"message": "Faculty availability record removed successfully", "id": availability_id}
+
+
+# -------------------- Bulk CSV Import API --------------------
+EMAIL_REGEX = re.compile(r"^[\w\.\+\-]+@[\w\-]+\.[a-zA-Z0-9\.\-]+$")
+
+
+@app.post("/api/import/csv")
+def import_csv_data(
+    payload: CsvImportRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    content = payload.csv_content.lstrip("\ufeff").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="CSV content is empty.")
+
+    reader = csv.reader(io.StringIO(content))
+    try:
+        raw_headers = next(reader)
+    except StopIteration:
+        raise HTTPException(status_code=400, detail="CSV file contains no rows.")
+
+    headers = [h.strip().lower().replace(" ", "_") for h in raw_headers]
+    header_set = set(headers)
+
+    valid_rows = []
+    invalid_rows = []
+    seen_keys = set()
+
+    # Pre-fetch existing data for duplicate & reference checking
+    existing_sections = {s.name.lower(): s for s in db.query(ClassSection).all()}
+    existing_sections_by_id = {s.id: s for s in db.query(ClassSection).all()}
+    existing_subjects = {s.code.lower(): s for s in db.query(Subject).all()}
+    existing_subjects_by_id = {s.id: s for s in db.query(Subject).all()}
+    existing_faculty = {f.employee_id.lower(): f for f in db.query(Faculty).all()}
+    existing_faculty_by_id = {f.id: f for f in db.query(Faculty).all()}
+    existing_faculty_emails = {f.email.lower(): f for f in db.query(Faculty).all()}
+    existing_rooms = {r.name.lower(): r for r in db.query(Room).all()}
+    existing_rooms_by_id = {r.id: r for r in db.query(Room).all()}
+    existing_mappings = {(m.faculty_id, m.subject_id): m for m in db.query(FacultySubject).all()}
+    existing_offerings = {(o.class_id, o.subject_id): o for o in db.query(CourseOffering).all()}
+
+    row_index = 1
+    for raw_row in reader:
+        row_index += 1
+        if not any(cell.strip() for cell in raw_row):
+            continue  # Skip blank lines
+
+        row_dict = {}
+        for idx, h in enumerate(headers):
+            row_dict[h] = raw_row[idx].strip() if idx < len(raw_row) else ""
+
+        errors = []
+
+        if payload.entity == "sections":
+            # Support Sample_Dataset (class_id,programme,semester,section,student_count) or standard (name,department,academic_year,semester)
+            if "class_id" in header_set:
+                name = row_dict.get("class_id", "")
+                dept = row_dict.get("programme") or row_dict.get("department") or "Computer Science"
+                sem_str = row_dict.get("semester", "1")
+                sec_label = row_dict.get("section", "")
+                if sec_label and sec_label.lower() not in name.lower():
+                    name = f"{name}-{sec_label}"
+            else:
+                name = row_dict.get("name") or row_dict.get("section_name", "")
+                dept = row_dict.get("department", "Computer Science")
+                sem_str = row_dict.get("semester", "1")
+
+            if not name:
+                errors.append("Section name/class_id is required.")
+            try:
+                semester = int(sem_str)
+                if not 1 <= semester <= 8:
+                    errors.append(f"Semester must be between 1 and 8 (got {semester}).")
+            except ValueError:
+                errors.append(f"Invalid integer for semester: '{sem_str}'.")
+                semester = 1
+
+            year_str = row_dict.get("academic_year")
+            if year_str:
+                try:
+                    year = int(year_str)
+                    if not 1 <= year <= 4:
+                        errors.append(f"Academic year must be between 1 and 4 (got {year}).")
+                except ValueError:
+                    errors.append(f"Invalid integer for academic_year: '{year_str}'.")
+                    year = ((semester - 1) // 2) + 1
+            else:
+                year = max(1, min(4, ((semester - 1) // 2) + 1))
+
+            student_count_str = row_dict.get("student_count")
+            if student_count_str:
+                try:
+                    sc = int(student_count_str)
+                    if sc < 1:
+                        errors.append(f"Student count must be positive integer (got {sc}).")
+                    student_count_val = max(1, sc)
+                except ValueError:
+                    errors.append(f"Invalid integer for student_count: '{student_count_str}'.")
+                    student_count_val = 60
+            else:
+                student_count_val = 60
+
+            key = name.lower()
+            if key in seen_keys:
+                errors.append(f"Duplicate section name in CSV: '{name}'.")
+            elif key in existing_sections:
+                errors.append(f"Section '{name}' already exists in the database.")
+            seen_keys.add(key)
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {
+                        "name": name,
+                        "department": dept,
+                        "academic_year": year,
+                        "semester": semester,
+                        "student_count": student_count_val,
+                        "is_active": True,
+                    },
+                })
+
+        elif payload.entity == "subjects":
+            # Support Sample_Dataset (subject_id,subject_name,subject_type,periods_per_week,duration_periods,required_room_type) or standard (code,name,department)
+            code = (row_dict.get("code") or row_dict.get("subject_id", "")).upper()
+            name = row_dict.get("name") or row_dict.get("subject_name", "")
+            dept = row_dict.get("department") or row_dict.get("programme") or "Computer Science"
+
+            if not code:
+                errors.append("Subject code / subject_id is required.")
+            if not name:
+                errors.append("Subject name is required.")
+
+            key = code.lower()
+            if key in seen_keys:
+                errors.append(f"Duplicate subject code in CSV: '{code}'.")
+            elif key in existing_subjects:
+                errors.append(f"Subject code '{code}' already exists in the database.")
+            seen_keys.add(key)
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {"code": code, "name": name, "department": dept},
+                })
+
+        elif payload.entity == "faculty":
+            # Support Sample_Dataset (faculty_id,faculty_name,max_periods_per_week,max_periods_per_day) or standard (employee_id,name,email,department)
+            emp_id = (row_dict.get("employee_id") or row_dict.get("faculty_id", "")).upper()
+            name = row_dict.get("name") or row_dict.get("faculty_name", "")
+            dept = row_dict.get("department", "Computer Science")
+            email = row_dict.get("email", "")
+
+            if not emp_id:
+                errors.append("Faculty ID / employee_id is required.")
+            if not name:
+                errors.append("Faculty name is required.")
+
+            if not email:
+                email = f"{emp_id.lower().replace('-', '')}@university.edu"
+            elif not EMAIL_REGEX.match(email):
+                errors.append(f"Invalid email address: '{email}'.")
+
+            key = emp_id.lower()
+            if key in seen_keys:
+                errors.append(f"Duplicate employee ID in CSV: '{emp_id}'.")
+            elif key in existing_faculty:
+                errors.append(f"Employee ID '{emp_id}' already exists in database.")
+            seen_keys.add(key)
+
+            if email.lower() in existing_faculty_emails:
+                errors.append(f"Email '{email}' already registered to another faculty member.")
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {
+                        "employee_id": emp_id,
+                        "name": name,
+                        "email": email,
+                        "department": dept,
+                        "is_active": True,
+                    },
+                })
+
+        elif payload.entity == "rooms":
+            # Support Sample_Dataset (room_id,room_name,room_type,capacity) or standard (name,room_type,capacity,building)
+            name = row_dict.get("name") or row_dict.get("room_name") or row_dict.get("room_id", "")
+            raw_type = (row_dict.get("room_type") or "classroom").strip().lower()
+            cap_str = row_dict.get("capacity", "60")
+            building = row_dict.get("building") or "Main Campus"
+
+            if not name:
+                errors.append("Room name is required.")
+
+            norm_type = "classroom"
+            if raw_type in ("lab", "laboratory"):
+                norm_type = "lab"
+            elif raw_type in ("classroom", "lecture_hall", "lecture"):
+                norm_type = "classroom"
+            else:
+                errors.append(f"Invalid room type: '{raw_type}'. Must be classroom or lab.")
+
+            try:
+                capacity = int(cap_str)
+                if capacity <= 0:
+                    errors.append(f"Capacity must be greater than zero (got {capacity}).")
+            except ValueError:
+                errors.append(f"Invalid integer for capacity: '{cap_str}'.")
+                capacity = 60
+
+            key = name.lower()
+            if key in seen_keys:
+                errors.append(f"Duplicate room name in CSV: '{name}'.")
+            elif key in existing_rooms:
+                errors.append(f"Room '{name}' already exists in database.")
+            seen_keys.add(key)
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {
+                        "name": name,
+                        "room_type": norm_type,
+                        "capacity": capacity,
+                        "building": building,
+                        "is_active": True,
+                    },
+                })
+
+        elif payload.entity == "faculty_subjects":
+            fac_ref = row_dict.get("faculty_id") or row_dict.get("employee_id", "")
+            sub_ref = row_dict.get("subject_id") or row_dict.get("subject_code", "")
+
+            fac = None
+            if fac_ref.isdigit() and int(fac_ref) in existing_faculty_by_id:
+                fac = existing_faculty_by_id[int(fac_ref)]
+            elif fac_ref.lower() in existing_faculty:
+                fac = existing_faculty[fac_ref.lower()]
+            else:
+                errors.append(f"Faculty reference '{fac_ref}' does not match any registered faculty.")
+
+            sub = None
+            if sub_ref.isdigit() and int(sub_ref) in existing_subjects_by_id:
+                sub = existing_subjects_by_id[int(sub_ref)]
+            elif sub_ref.lower() in existing_subjects:
+                sub = existing_subjects[sub_ref.lower()]
+            else:
+                errors.append(f"Subject reference '{sub_ref}' does not match any registered subject.")
+
+            if fac and sub:
+                pair = (fac.id, sub.id)
+                if pair in seen_keys:
+                    errors.append(f"Duplicate qualification mapping in CSV: Faculty {fac.name} -> Subject {sub.code}.")
+                elif pair in existing_mappings:
+                    errors.append(f"Qualification mapping already exists in database: Faculty {fac.name} -> Subject {sub.code}.")
+                seen_keys.add(pair)
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {"faculty_id": fac.id, "subject_id": sub.id},
+                    "display": {"faculty_name": fac.name, "subject_code": sub.code},
+                })
+
+        elif payload.entity == "requirements":
+            # Support Sample_Dataset (class_id,subject_id,faculty_id,sessions_per_week,duration_periods) or standard (class_id,subject_id,faculty_id,weekly_periods,requires_lab)
+            class_ref = row_dict.get("class_id") or row_dict.get("section", "")
+            sub_ref = row_dict.get("subject_id") or row_dict.get("subject_code", "")
+            fac_ref = row_dict.get("faculty_id") or row_dict.get("employee_id", "")
+
+            # Resolve Section
+            sec = None
+            if class_ref.isdigit() and int(class_ref) in existing_sections_by_id:
+                sec = existing_sections_by_id[int(class_ref)]
+            elif class_ref.lower() in existing_sections:
+                sec = existing_sections[class_ref.lower()]
+            else:
+                # Try partial match (e.g. CSE301 matches CSE301-A)
+                matched_sec = next((s for k, s in existing_sections.items() if class_ref.lower() in k or k in class_ref.lower()), None)
+                if matched_sec:
+                    sec = matched_sec
+                else:
+                    errors.append(f"Class/Section '{class_ref}' not found in database.")
+
+            # Resolve Subject
+            sub = None
+            if sub_ref.isdigit() and int(sub_ref) in existing_subjects_by_id:
+                sub = existing_subjects_by_id[int(sub_ref)]
+            elif sub_ref.lower() in existing_subjects:
+                sub = existing_subjects[sub_ref.lower()]
+            else:
+                errors.append(f"Subject '{sub_ref}' not found in database.")
+
+            # Resolve Faculty
+            fac = None
+            if fac_ref.isdigit() and int(fac_ref) in existing_faculty_by_id:
+                fac = existing_faculty_by_id[int(fac_ref)]
+            elif fac_ref.lower() in existing_faculty:
+                fac = existing_faculty[fac_ref.lower()]
+            else:
+                errors.append(f"Faculty '{fac_ref}' not found in database.")
+
+            # Resolve Periods
+            sessions_str = row_dict.get("sessions_per_week") or row_dict.get("weekly_periods", "4")
+            duration_str = row_dict.get("duration_periods", "1")
+            try:
+                sessions = int(sessions_str)
+                duration = int(duration_str)
+                total_periods = sessions * duration
+                if not 1 <= total_periods <= 35:
+                    errors.append(f"Total weekly periods must be between 1 and 35 (got {total_periods}).")
+            except ValueError:
+                errors.append(f"Invalid integers for periods: sessions='{sessions_str}', duration='{duration_str}'.")
+                total_periods = 4
+
+            req_lab = False
+            raw_lab = row_dict.get("requires_lab") or row_dict.get("required_room_type", "")
+            if raw_lab.lower() in ("true", "1", "yes", "lab"):
+                req_lab = True
+            elif sub and ("lab" in sub.name.lower() or sub.code.upper().endswith("L")):
+                req_lab = True
+
+            if sec and sub:
+                pair = (sec.id, sub.id)
+                if pair in seen_keys:
+                    errors.append(f"Duplicate assignment in CSV: Subject {sub.code} for Section {sec.name}.")
+                elif pair in existing_offerings:
+                    errors.append(f"Course requirement already exists in database for Section {sec.name} and Subject {sub.code}.")
+                seen_keys.add(pair)
+
+            if errors:
+                invalid_rows.append({"row": row_index, "data": row_dict, "errors": errors})
+            else:
+                valid_rows.append({
+                    "row": row_index,
+                    "model_data": {
+                        "class_id": sec.id,
+                        "subject_id": sub.id,
+                        "faculty_id": fac.id,
+                        "weekly_periods": total_periods,
+                        "requires_lab": req_lab,
+                    },
+                    "display": {
+                        "class_name": sec.name,
+                        "subject_code": sub.code,
+                        "faculty_name": fac.name,
+                        "weekly_periods": total_periods,
+                        "requires_lab": req_lab,
+                    },
+                })
+
+    total_rows = len(valid_rows) + len(invalid_rows)
+
+    # If preview_only is True, return validation analysis without committing
+    if payload.preview_only:
+        return {
+            "entity": payload.entity,
+            "total_rows": total_rows,
+            "valid_count": len(valid_rows),
+            "invalid_count": len(invalid_rows),
+            "valid_rows": valid_rows,
+            "invalid_rows": invalid_rows,
+            "can_import": len(valid_rows) > 0 and len(invalid_rows) == 0,
+            "summary": (
+                f"Validation complete: {len(valid_rows)} valid row(s), {len(invalid_rows)} error(s) found out of {total_rows} total rows."
+            ),
+        }
+
+    # Execute commit
+    if not valid_rows:
+        raise HTTPException(status_code=400, detail="Cannot import: no valid rows found.")
+    if invalid_rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot import: {len(invalid_rows)} invalid rows must be corrected first.",
+        )
+
+    try:
+        if payload.entity == "sections":
+            for vr in valid_rows:
+                db.add(ClassSection(**vr["model_data"]))
+        elif payload.entity == "subjects":
+            for vr in valid_rows:
+                db.add(Subject(**vr["model_data"]))
+        elif payload.entity == "faculty":
+            for vr in valid_rows:
+                db.add(Faculty(**vr["model_data"]))
+        elif payload.entity == "rooms":
+            for vr in valid_rows:
+                db.add(Room(**vr["model_data"]))
+        elif payload.entity == "faculty_subjects":
+            for vr in valid_rows:
+                db.add(FacultySubject(**vr["model_data"]))
+        elif payload.entity == "requirements":
+            for vr in valid_rows:
+                db.add(CourseOffering(**vr["model_data"]))
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database import failed: {str(exc)}")
+
+    return {
+        "status": "success",
+        "entity": payload.entity,
+        "imported_count": len(valid_rows),
+        "message": f"Successfully imported {len(valid_rows)} {payload.entity} records into the database.",
+    }
+
+
+# -------------------- Load Demo Data (Optional Explicit Action) --------------------
+@app.post("/api/academic-data/load-demo-data")
+def load_sample_dataset_demo_data(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    """
+    Explicitly populates database from Sample_Dataset files ONLY when requested by the administrator.
+    """
+    import os
+    from pathlib import Path
+
+    sample_dir = Path(__file__).resolve().parents[2] / "Sample_Dataset"
+    if not sample_dir.exists():
+        raise HTTPException(status_code=404, detail="Sample_Dataset directory not found.")
+
+    imported_summary = {}
+
+    try:
+        # 1. Classes
+        classes_path = sample_dir / "classes.csv"
+        if classes_path.exists():
+            with open(classes_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    cid = r["class_id"].strip()
+                    sec = r["section"].strip()
+                    name = f"{cid}-{sec}" if sec and sec not in cid else cid
+                    if not db.query(ClassSection).filter(ClassSection.name == name).first():
+                        sem = int(r.get("semester", 1))
+                        db.add(ClassSection(
+                            name=name,
+                            department=r.get("programme", "CSE"),
+                            semester=sem,
+                            academic_year=max(1, min(4, ((sem - 1) // 2) + 1)),
+                            student_count=int(r.get("student_count", 60) or 60),
+                            is_active=True,
+                        ))
+                        added += 1
+                db.commit()
+                imported_summary["sections"] = added
+
+        # 2. Subjects
+        sub_path = sample_dir / "subjects.csv"
+        if sub_path.exists():
+            with open(sub_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    code = r["subject_id"].strip().upper()
+                    if not db.query(Subject).filter(Subject.code == code).first():
+                        db.add(Subject(
+                            code=code,
+                            name=r["subject_name"].strip(),
+                            department="CSE",
+                        ))
+                        added += 1
+                db.commit()
+                imported_summary["subjects"] = added
+
+        # 3. Faculty
+        fac_path = sample_dir / "faculty.csv"
+        if fac_path.exists():
+            with open(fac_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    fid = r["faculty_id"].strip()
+                    if not db.query(Faculty).filter(Faculty.employee_id == fid).first():
+                        db.add(Faculty(
+                            employee_id=fid,
+                            name=r["faculty_name"].strip(),
+                            email=f"{fid.lower()}@optisched.edu",
+                            department="CSE",
+                            is_active=True,
+                        ))
+                        added += 1
+                db.commit()
+                imported_summary["faculty"] = added
+
+        # 4. Rooms
+        room_path = sample_dir / "rooms.csv"
+        if room_path.exists():
+            with open(room_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    rname = r.get("room_name", r.get("room_id", "")).strip()
+                    if not db.query(Room).filter(Room.name == rname).first():
+                        rtype = r.get("room_type", "classroom").strip().lower()
+                        db.add(Room(
+                            name=rname,
+                            room_type="lab" if "lab" in rtype else "classroom",
+                            capacity=int(r.get("capacity", 60)),
+                            building="Academic Wing",
+                            is_active=True,
+                        ))
+                        added += 1
+                db.commit()
+                imported_summary["rooms"] = added
+
+        # 5. Faculty Subjects
+        fs_path = sample_dir / "faculty_subjects.csv"
+        if fs_path.exists():
+            fac_by_code = {f.employee_id.lower(): f for f in db.query(Faculty).all()}
+            sub_by_code = {s.code.lower(): s for s in db.query(Subject).all()}
+            with open(fs_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    fid = r["faculty_id"].strip().lower()
+                    sid = r["subject_id"].strip().lower()
+                    if fid in fac_by_code and sid in sub_by_code:
+                        f_obj = fac_by_code[fid]
+                        s_obj = sub_by_code[sid]
+                        if not db.query(FacultySubject).filter(
+                            FacultySubject.faculty_id == f_obj.id,
+                            FacultySubject.subject_id == s_obj.id,
+                        ).first():
+                            db.add(FacultySubject(faculty_id=f_obj.id, subject_id=s_obj.id))
+                            added += 1
+                db.commit()
+                imported_summary["qualifications"] = added
+
+        # 6. Requirements
+        req_path = sample_dir / "requirements.csv"
+        if req_path.exists():
+            sec_by_name = {s.name.lower(): s for s in db.query(ClassSection).all()}
+            fac_by_code = {f.employee_id.lower(): f for f in db.query(Faculty).all()}
+            sub_by_code = {s.code.lower(): s for s in db.query(Subject).all()}
+            with open(req_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                added = 0
+                for r in reader:
+                    cid = r["class_id"].strip().lower()
+                    sid = r["subject_id"].strip().lower()
+                    fid = r["faculty_id"].strip().lower()
+
+                    sec = next((s for k, s in sec_by_name.items() if cid in k), None)
+                    sub = sub_by_code.get(sid)
+                    fac = fac_by_code.get(fid)
+
+                    if sec and sub and fac:
+                        if not db.query(CourseOffering).filter(
+                            CourseOffering.class_id == sec.id,
+                            CourseOffering.subject_id == sub.id,
+                        ).first():
+                            sessions = int(r.get("sessions_per_week", 4))
+                            duration = int(r.get("duration_periods", 1))
+                            is_lab = "lab" in sub.name.lower() or sub.code.endswith("L")
+                            db.add(CourseOffering(
+                                class_id=sec.id,
+                                subject_id=sub.id,
+                                faculty_id=fac.id,
+                                weekly_periods=sessions * duration,
+                                requires_lab=is_lab,
+                            ))
+                            added += 1
+                db.commit()
+                imported_summary["requirements"] = added
+
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to load demo data: {str(exc)}")
+
+    return {
+        "status": "success",
+        "message": "Demo sample dataset loaded successfully.",
+        "imported": imported_summary,
+    }
 
 
 # -------------------- Independent Schedule Validator --------------------
@@ -1018,6 +2664,8 @@ def _validate_generated_schedule(
     faculty_map: dict[int, Faculty],
     subject_map: dict[int, Subject],
     faculty_subjects_map: dict[int, set[int]],
+    sections_map: dict[int, ClassSection] | None = None,
+    blocked_intervals_map: dict[int, list[tuple[str, int, int]]] | None = None,
 ) -> dict:
     faculty_clashes = []
     room_clashes = []
@@ -1052,7 +2700,7 @@ def _validate_generated_schedule(
                         f"{a['start_time']}–{a['end_time']} and {b['start_time']}–{b['end_time']}"
                     )
 
-    # 2. Room eligibility check
+    # 2. Room eligibility and capacity check
     offering_by_pair = {(o.class_id, o.subject_id): o for o in offerings}
     for row in schedule_rows:
         off = offering_by_pair.get((row["class_id"], row["subject_id"]))
@@ -1074,6 +2722,26 @@ def _validate_generated_schedule(
                 eligibility_violations.append(
                     f"Faculty {row['faculty_name']} is not qualified for subject {row['subject_code']}"
                 )
+
+        # 4. Room seating capacity check
+        if sections_map and row["class_id"] in sections_map and row["room_id"] in rooms_map:
+            sec = sections_map[row["class_id"]]
+            rm = rooms_map[row["room_id"]]
+            if sec.student_count is not None and rm.capacity < sec.student_count:
+                eligibility_violations.append(
+                    f"Room {rm.name} capacity ({rm.capacity}) is insufficient for section {sec.name} ({sec.student_count} students)"
+                )
+
+        # 5. Faculty availability check
+        if blocked_intervals_map and row["faculty_id"] in blocked_intervals_map:
+            unavails = blocked_intervals_map[row["faculty_id"]]
+            r_day = row["day"].strip().lower()
+            r_start, r_end = _to_minutes(row["start_time"]), _to_minutes(row["end_time"])
+            for u_day, u_start, u_end in unavails:
+                if r_day == u_day and max(r_start, u_start) < min(r_end, u_end):
+                    faculty_clashes.append(
+                        f"Faculty {row['faculty_name']} scheduled during unavailable block on {row['day']} ({row['start_time']}–{row['end_time']})"
+                    )
 
     total_clashes = (
         len(faculty_clashes)
@@ -1104,7 +2772,7 @@ def _validate_generated_schedule(
 def generate_timetable(
     request: TimetableGenerateRequest,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_authenticated),
 ):
     if request.scope in {"class", "section"} and request.class_id is None:
         raise HTTPException(status_code=400, detail="class_id is required for class/section scope.")
@@ -1216,19 +2884,43 @@ def generate_timetable(
                 )
 
         if offering.requires_lab:
-            eligible_rooms = lab_rooms
-            if not eligible_rooms:
+            if not lab_rooms:
                 raise HTTPException(
                     status_code=400,
                     detail=f"No active laboratory room is available for lab subject {subject.code}.",
                 )
+            if section.student_count is not None:
+                eligible_rooms = [r for r in lab_rooms if r.capacity >= section.student_count]
+                if not eligible_rooms:
+                    max_lab_cap = max((r.capacity for r in lab_rooms), default=0)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"No active laboratory room has sufficient capacity for section '{section.name}' "
+                            f"(requires {section.student_count} seats, maximum available lab capacity is {max_lab_cap})."
+                        ),
+                    )
+            else:
+                eligible_rooms = lab_rooms
         else:
-            eligible_rooms = classroom_rooms
-            if not eligible_rooms:
+            if not classroom_rooms:
                 raise HTTPException(
                     status_code=400,
                     detail=f"No active classroom or lecture hall is available for non-lab subject {subject.code}.",
                 )
+            if section.student_count is not None:
+                eligible_rooms = [r for r in classroom_rooms if r.capacity >= section.student_count]
+                if not eligible_rooms:
+                    max_class_cap = max((r.capacity for r in classroom_rooms), default=0)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"No active classroom/lecture hall has sufficient capacity for section '{section.name}' "
+                            f"(requires {section.student_count} seats, maximum available classroom capacity is {max_class_cap})."
+                        ),
+                    )
+            else:
+                eligible_rooms = classroom_rooms
 
         for occurrence in range(offering.weekly_periods):
             lessons.append({
@@ -1296,6 +2988,17 @@ def generate_timetable(
             ),
         )
 
+    # Fetch faculty unavailable intervals for CP-SAT hard constraints
+    blocked_avail = db.query(FacultyAvailability).filter(
+        FacultyAvailability.is_available.is_(False)
+    ).all()
+    blocked_map: dict[int, list[tuple[str, int, int]]] = {}
+    for b in blocked_avail:
+        b_day = b.day.strip().lower()
+        b_start = _to_minutes(b.start_time)
+        b_end = _to_minutes(b.end_time)
+        blocked_map.setdefault(b.faculty_id, []).append((b_day, b_start, b_end))
+
     # 5. Build OR-Tools CP-SAT Model
     model = cp_model.CpModel()
     choice_vars = {}
@@ -1310,10 +3013,23 @@ def generate_timetable(
         sec = lesson["section"]
         slots = section_slots[sec.id]
         fac = lesson["faculty"]
+        unavail_intervals = blocked_map.get(fac.id, [])
 
         for slot_i, slot in enumerate(slots):
+            slot_day = slot["day"].strip().lower()
+            s_start = slot["start_minute"]
+            s_end = slot["end_minute"]
+            is_faculty_blocked = any(
+                slot_day == u_day and max(s_start, u_start) < min(s_end, u_end)
+                for u_day, u_start, u_end in unavail_intervals
+            )
+
             for room in lesson["rooms"]:
                 var = model.NewBoolVar(f"x_l{lesson_i}_s{slot_i}_r{room.id}")
+                if is_faculty_blocked:
+                    # Hard Constraint: Faculty cannot be scheduled in blocked/unavailable periods
+                    model.Add(var == 0)
+
                 choice_vars[(lesson_i, slot_i, room.id)] = (var, lesson, slot, room)
                 by_lesson[lesson_i].append(var)
                 by_section_slot.setdefault((sec.id, slot_i), []).append(var)
@@ -1386,20 +3102,34 @@ def generate_timetable(
     model.Minimize(sum(distribution_penalties) + sum(period_order_terms))
 
     # 6. Solve CP-SAT Model
+    t_start = time.perf_counter()
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = request.max_time_seconds
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
+    solve_duration = round(time.perf_counter() - t_start, 3)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         status_name = solver.StatusName(status)
+        if status == cp_model.INFEASIBLE:
+            detail = (
+                f"No feasible timetable exists (Solver status: INFEASIBLE). "
+                "The mathematical constraints cannot be satisfied simultaneously with the provided academic data. "
+                "Verify room availability, faculty schedules, or reduce required weekly periods."
+            )
+        elif status == cp_model.UNKNOWN:
+            detail = (
+                f"Solver timed out before finding a feasible timetable (Solver status: UNKNOWN). "
+                f"Time limit of {request.max_time_seconds}s reached without finding a conflict-free solution. "
+                "Try allocating more search time or relaxing tight constraints."
+            )
+        elif status == cp_model.MODEL_INVALID:
+            detail = "Constraint model definition was invalid (Solver status: MODEL_INVALID)."
+        else:
+            detail = f"Timetable generation could not find a feasible solution (Solver status: {status_name})."
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"No feasible timetable found (Solver status: {status_name}). "
-                "Check that there are sufficient rooms, periods per day, and faculty availability without clash conflicts, "
-                "or reduce weekly periods."
-            ),
+            detail=detail,
         )
 
     # 7. Build schedule output
@@ -1482,12 +3212,41 @@ def generate_timetable(
         faculty_map=faculty_map,
         subject_map=subject_map,
         faculty_subjects_map=fs_map,
+        sections_map=section_map,
+        blocked_intervals_map=blocked_map,
     )
+
+    # Confirm that all required sessions are scheduled
+    if len(result) != len(lessons):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Integrity check failed: {len(lessons)} weekly period(s) required by curriculum, "
+                f"but solver only scheduled {len(result)} period(s)."
+            ),
+        )
+
+    # Reject invalid output if any clashes or eligibility violations exist
+    if not validation_report["is_valid"]:
+        clash_summary = []
+        if validation_report["faculty_clashes"] > 0:
+            clash_summary.append(f"{validation_report['faculty_clashes']} faculty double-booking(s)")
+        if validation_report["room_clashes"] > 0:
+            clash_summary.append(f"{validation_report['room_clashes']} room double-booking(s)")
+        if validation_report["section_clashes"] > 0:
+            clash_summary.append(f"{validation_report['section_clashes']} section double-booking(s)")
+        if validation_report["eligibility_violations"] > 0:
+            clash_summary.append(f"{validation_report['eligibility_violations']} qualification/suitability mismatch(es)")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Independent validation rejected generated timetable: {', '.join(clash_summary)}.",
+        )
 
     # 10. Notes
     notes = [
         f"Working hours active: {working_hours_display}.",
         f"Scheduled session window: {scheduled_span}.",
+        f"Solver solved in {solve_duration}s with status {solver.StatusName(status)}.",
         "Faculty, section, and room exclusivity strictly enforced across all real-time intervals.",
         "Sessions distributed across configured weekdays using CP-SAT load-balancing.",
     ]
@@ -1506,6 +3265,9 @@ def generate_timetable(
     return {
         "status": "success",
         "solver_status": "optimal" if status == cp_model.OPTIMAL else "feasible",
+        "solve_time_seconds": solve_duration,
+        "required_sessions_count": len(lessons),
+        "scheduled_sessions_count": len(result),
         "scope": request.scope,
         "working_hours": working_hours_display,
         "scheduled_span": scheduled_span,
@@ -1518,4 +3280,314 @@ def generate_timetable(
         "schedule": result,
         "validation": validation_report,
         "notes": notes,
+    }
+
+
+# -------------------- Timetable Publishing & Persistence APIs --------------------
+@app.post("/api/timetable/publish", status_code=201)
+def publish_timetable(
+    request: TimetablePublishRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+):
+    if not request.schedule:
+        raise HTTPException(status_code=400, detail="Cannot publish an empty timetable schedule.")
+
+    title_clean = request.title.strip()
+    if not title_clean:
+        raise HTTPException(status_code=400, detail="Timetable title cannot be empty.")
+
+    # 1. Independent validation before publishing to prevent corrupt or conflicting schedules
+    offerings = db.query(CourseOffering).all()
+    rooms_map = {r.id: r for r in db.query(Room).all()}
+    faculty_map = {f.id: f for f in db.query(Faculty).all()}
+    subject_map = {s.id: s for s in db.query(Subject).all()}
+    fs_map: dict[int, set[int]] = {}
+    for fs in db.query(FacultySubject).all():
+        fs_map.setdefault(fs.subject_id, set()).add(fs.faculty_id)
+
+    sections_map = {s.id: s for s in db.query(ClassSection).all()}
+    blocked_avail = db.query(FacultyAvailability).filter(FacultyAvailability.is_available.is_(False)).all()
+    blocked_map: dict[int, list[tuple[str, int, int]]] = {}
+    for b in blocked_avail:
+        blocked_map.setdefault(b.faculty_id, []).append((b.day.strip().lower(), _to_minutes(b.start_time), _to_minutes(b.end_time)))
+
+    validation_report = _validate_generated_schedule(
+        schedule_rows=request.schedule,
+        offerings=offerings,
+        rooms_map=rooms_map,
+        faculty_map=faculty_map,
+        subject_map=subject_map,
+        faculty_subjects_map=fs_map,
+        sections_map=sections_map,
+        blocked_intervals_map=blocked_map,
+    )
+
+    if not validation_report["is_valid"]:
+        clash_summary = []
+        if validation_report["faculty_clashes"] > 0:
+            clash_summary.append(f"{validation_report['faculty_clashes']} faculty clash(es)")
+        if validation_report["room_clashes"] > 0:
+            clash_summary.append(f"{validation_report['room_clashes']} room clash(es)")
+        if validation_report["section_clashes"] > 0:
+            clash_summary.append(f"{validation_report['section_clashes']} section clash(es)")
+        if validation_report["eligibility_violations"] > 0:
+            clash_summary.append(f"{validation_report['eligibility_violations']} eligibility/capacity violation(s)")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot publish schedule with unresolved conflicts: {', '.join(clash_summary)}.",
+        )
+
+    # 2. Versioning: Find previous version for this scope/class/semester to preserve historical records
+    version_query = db.query(PublishedTimetable)
+    if request.scope in {"class", "section"} and request.class_id:
+        version_query = version_query.filter(PublishedTimetable.class_id == request.class_id)
+    elif request.scope == "semester" and request.semester:
+        version_query = version_query.filter(PublishedTimetable.semester == request.semester)
+    elif request.scope == "department" and request.department:
+        version_query = version_query.filter(PublishedTimetable.department == request.department)
+
+    previous_versions = version_query.order_by(PublishedTimetable.version.desc()).all()
+    next_version = (previous_versions[0].version + 1) if previous_versions else 1
+
+    # Mark previous versions for this target scope as inactive (preserving history)
+    for prev in previous_versions:
+        prev.is_active = False
+
+    publisher_name = current_user.get("user_id") or "Admin"
+
+    # 3. Create PublishedTimetable record
+    pub_table = PublishedTimetable(
+        title=title_clean,
+        version=next_version,
+        scope=request.scope,
+        class_id=request.class_id,
+        department=request.department,
+        semester=request.semester,
+        working_hours=request.working_hours,
+        solver_status=request.solver_status,
+        solve_time_seconds=request.solve_time_seconds,
+        sections_scheduled=request.sections_scheduled,
+        weekly_sessions_scheduled=len(request.schedule),
+        validation_summary=validation_report,
+        notes=request.notes or [],
+        is_active=True,
+        published_by=publisher_name,
+    )
+
+    db.add(pub_table)
+    db.flush()
+
+    # 4. Insert all schedule entries
+    for row in request.schedule:
+        entry = PublishedTimetableEntry(
+            timetable_id=pub_table.id,
+            day=row["day"],
+            period=row.get("period", ""),
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            class_id=row["class_id"],
+            class_name=row["class_name"],
+            department=row.get("department", ""),
+            semester=row.get("semester", 1),
+            subject_id=row.get("subject_id") or row.get("subject_code", 0),
+            subject_code=row["subject_code"],
+            subject_name=row["subject_name"],
+            faculty_id=row.get("faculty_id", 0),
+            faculty_name=row["faculty_name"],
+            room_id=row.get("room_id", 0),
+            room_name=row["room_name"],
+            room_type=row.get("room_type", "classroom"),
+            occurrence=row.get("occurrence", 1),
+        )
+        db.add(entry)
+
+    try:
+        db.commit()
+        db.refresh(pub_table)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to publish timetable: {str(exc)}")
+
+    return {
+        "status": "success",
+        "message": f"Timetable '{pub_table.title}' (Version {pub_table.version}) published successfully.",
+        "id": pub_table.id,
+        "title": pub_table.title,
+        "version": pub_table.version,
+        "scope": pub_table.scope,
+        "class_id": pub_table.class_id,
+        "semester": pub_table.semester,
+        "department": pub_table.department,
+        "sessions_published": len(request.schedule),
+        "published_at": pub_table.created_at.isoformat(),
+        "is_active": pub_table.is_active,
+    }
+
+
+@app.get("/api/timetable/published")
+def list_published_timetables(
+    scope: str | None = None,
+    class_id: int | None = None,
+    is_active: bool | None = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(PublishedTimetable)
+    if scope:
+        query = query.filter(PublishedTimetable.scope == scope)
+    if class_id:
+        query = query.filter(PublishedTimetable.class_id == class_id)
+    if is_active is not None:
+        query = query.filter(PublishedTimetable.is_active.is_(is_active))
+
+    timetables = query.order_by(PublishedTimetable.created_at.desc()).all()
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "version": t.version,
+            "scope": t.scope,
+            "class_id": t.class_id,
+            "department": t.department,
+            "semester": t.semester,
+            "working_hours": t.working_hours,
+            "solver_status": t.solver_status,
+            "solve_time_seconds": t.solve_time_seconds,
+            "sections_scheduled": t.sections_scheduled,
+            "weekly_sessions_scheduled": t.weekly_sessions_scheduled,
+            "is_active": t.is_active,
+            "published_by": t.published_by,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t in timetables
+    ]
+
+
+@app.get("/api/timetable/published/latest")
+def get_latest_published_timetable(
+    class_id: int | None = None,
+    semester: int | None = None,
+    department: str | None = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(PublishedTimetable).filter(PublishedTimetable.is_active.is_(True))
+    if class_id is not None:
+        query = query.filter(PublishedTimetable.class_id == class_id)
+    if semester is not None:
+        query = query.filter(PublishedTimetable.semester == semester)
+    if department is not None:
+        query = query.filter(PublishedTimetable.department == department)
+
+    timetable = query.order_by(PublishedTimetable.version.desc(), PublishedTimetable.created_at.desc()).first()
+    if not timetable:
+        return {
+            "status": "not_published",
+            "message": "No active published timetable found for the requested criteria.",
+            "schedule": [],
+        }
+
+    entries = [
+        {
+            "id": e.id,
+            "day": e.day,
+            "period": e.period,
+            "start_time": e.start_time,
+            "end_time": e.end_time,
+            "class_id": e.class_id,
+            "class_name": e.class_name,
+            "department": e.department,
+            "semester": e.semester,
+            "subject_id": e.subject_id,
+            "subject_code": e.subject_code,
+            "subject_name": e.subject_name,
+            "faculty_id": e.faculty_id,
+            "faculty_name": e.faculty_name,
+            "room_id": e.room_id,
+            "room_name": e.room_name,
+            "room_type": e.room_type,
+            "occurrence": e.occurrence,
+        }
+        for e in timetable.entries
+    ]
+
+    day_rank = {day: i for i, day in enumerate(VALID_DAYS)}
+    entries.sort(key=lambda row: (
+        day_rank.get(row["day"], 99),
+        _to_minutes(row["start_time"]),
+    ))
+
+    return {
+        "status": "success",
+        "id": timetable.id,
+        "title": timetable.title,
+        "version": timetable.version,
+        "scope": timetable.scope,
+        "class_id": timetable.class_id,
+        "department": timetable.department,
+        "semester": timetable.semester,
+        "working_hours": timetable.working_hours,
+        "solver_status": timetable.solver_status,
+        "solve_time_seconds": timetable.solve_time_seconds,
+        "weekly_sessions_scheduled": len(entries),
+        "is_active": timetable.is_active,
+        "published_at": timetable.created_at.isoformat(),
+        "schedule": entries,
+    }
+
+
+@app.get("/api/timetable/published/{timetable_id}")
+def get_published_timetable_by_id(
+    timetable_id: int,
+    db: Session = Depends(get_db),
+):
+    timetable = db.query(PublishedTimetable).filter(PublishedTimetable.id == timetable_id).first()
+    if not timetable:
+        raise HTTPException(status_code=404, detail="Published timetable not found")
+
+    entries = [
+        {
+            "id": e.id,
+            "day": e.day,
+            "period": e.period,
+            "start_time": e.start_time,
+            "end_time": e.end_time,
+            "class_id": e.class_id,
+            "class_name": e.class_name,
+            "department": e.department,
+            "semester": e.semester,
+            "subject_id": e.subject_id,
+            "subject_code": e.subject_code,
+            "subject_name": e.subject_name,
+            "faculty_id": e.faculty_id,
+            "faculty_name": e.faculty_name,
+            "room_id": e.room_id,
+            "room_name": e.room_name,
+            "room_type": e.room_type,
+            "occurrence": e.occurrence,
+        }
+        for e in timetable.entries
+    ]
+
+    day_rank = {day: i for i, day in enumerate(VALID_DAYS)}
+    entries.sort(key=lambda row: (
+        day_rank.get(row["day"], 99),
+        _to_minutes(row["start_time"]),
+    ))
+
+    return {
+        "id": timetable.id,
+        "title": timetable.title,
+        "version": timetable.version,
+        "scope": timetable.scope,
+        "class_id": timetable.class_id,
+        "department": timetable.department,
+        "semester": timetable.semester,
+        "working_hours": timetable.working_hours,
+        "solver_status": timetable.solver_status,
+        "solve_time_seconds": timetable.solve_time_seconds,
+        "weekly_sessions_scheduled": len(entries),
+        "is_active": timetable.is_active,
+        "published_by": timetable.published_by,
+        "created_at": timetable.created_at.isoformat(),
+        "schedule": entries,
     }
