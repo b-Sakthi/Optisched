@@ -23,6 +23,9 @@ class ClassSection(Base):
     semester: Mapped[int] = mapped_column(
         Integer, nullable=False
     )
+    student_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
     )
