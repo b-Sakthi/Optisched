@@ -11,7 +11,12 @@ from sqlalchemy.pool import StaticPool
 # Only load backend/.env if not executing in test mode
 if os.getenv("TESTING") != "1":
     ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
-    load_dotenv(ENV_FILE, override=True)
+    override = os.getenv("USE_LOCAL_DB") != "1"
+    load_dotenv(ENV_FILE, override=override)
+
+if os.getenv("USE_LOCAL_DB") == "1" and not os.getenv("DATABASE_URL", "").startswith("sqlite"):
+    local_db_path = Path(__file__).resolve().parents[2] / "local_demo.db"
+    os.environ["DATABASE_URL"] = f"sqlite:///{local_db_path.as_posix()}"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
