@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   ChevronDown,
@@ -16,12 +16,28 @@ import {
   GraduationCap,
   History,
   Eye,
+  Activity,
+  Trash2,
+  KeyRound,
+  ShieldCheck,
+  RefreshCw,
+  UserPlus,
 } from "lucide-react";
 import { PortalShell } from "@/components/PortalShell";
 import { AcademicDataManagement } from "@/components/AcademicDataManagement";
 import { TimetableSettings } from "@/components/TimetableSettings";
 import { TimetableGrid } from "@/components/TimetableGrid";
-import { API_BASE_URL, fetchWithAuth, toUiEntry } from "@/lib/api";
+import {
+  API_BASE_URL,
+  fetchWithAuth,
+  toUiEntry,
+  fetchUsers,
+  createUser,
+  deleteUser,
+  fetchSystemStatus,
+  validatePassword,
+  MIN_PASSWORD_LENGTH,
+} from "@/lib/api";
 import {
   Section,
   GenerateResponse,
@@ -31,9 +47,12 @@ import {
   FacultyMember,
   PublishedTimetable,
   ApiScheduleEntry,
+  User,
+  SystemStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@clerk/nextjs";
+import { useFormDraft } from "@/lib/useFormDraft";
 
 export default function AdminClientView({
   userName,
@@ -42,10 +61,46 @@ export default function AdminClientView({
   userName: string;
   userEmail: string;
 }) {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "academic-data" | "faculty" | "curriculum" | "settings"
+    "dashboard" | "academic-data" | "faculty" | "curriculum" | "settings" | "users" | "system"
   >("dashboard");
+
+  // User Management State
+  const [usersList, setUsersList] = useState<User[]>([]);
+  const [loadingUsers, setLoadingUsers] = useState(false);
+  const [newUserEmail, setNewUserEmail] = useState<string | null>(null);
+  const [newUserPassword, setNewUserPassword] = useState("");
+  const [newUserName, setNewUserName] = useState<string | null>(null);
+  const [newUserRole, setNewUserRole] = useState<("admin" | "faculty" | "student") | null>(null);
+  const [userSearch, setUserSearch] = useState("");
+  const [userActionNotice, setUserActionNotice] = useState("");
+  const [userActionError, setUserActionError] = useState("");
+  const [creatingUser, setCreatingUser] = useState(false);
+
+  // Form Draft Persistence (Google Chrome Modern Web Guidance)
+  const {
+    draft: userDraft,
+    hasRestoredDraft: hasRestoredUserDraft,
+    saveDraft: saveUserDraft,
+    clearDraft: clearUserDraft,
+  } = useFormDraft<{ name: string; email: string; role: "admin" | "faculty" | "student" }>({
+    formId: "admin_create_user",
+    userId,
+    initialValues: {
+      name: "",
+      email: "",
+      role: "student",
+    },
+  });
+
+  const activeUserName = newUserName !== null ? newUserName : (userDraft?.name ?? "");
+  const activeUserEmail = newUserEmail !== null ? newUserEmail : (userDraft?.email ?? "");
+  const activeUserRole = newUserRole !== null ? newUserRole : (userDraft?.role ?? "student");
+
+  // System Monitoring State
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [loadingSystemStatus, setLoadingSystemStatus] = useState(false);
 
   // View Mode: Section / Faculty / Room
   const [viewMode, setViewMode] = useState<"section" | "faculty" | "room">("section");
@@ -93,6 +148,17 @@ export default function AdminClientView({
   // Published timetables history state
   const [publishedTimetables, setPublishedTimetables] = useState<PublishedTimetable[]>([]);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const historyDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = historyDialogRef.current;
+    if (!dialog) return;
+    if (showHistoryModal) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [showHistoryModal]);
 
   const refreshSections = async () => {
     try {
@@ -191,6 +257,79 @@ export default function AdminClientView({
       }
     } catch {
       // silent
+    }
+  };
+
+  const refreshUsersList = async () => {
+    setLoadingUsers(true);
+    setUserActionError("");
+    try {
+      const data = await fetchUsers();
+      setUsersList(data);
+    } catch (err: unknown) {
+      setUserActionError(err instanceof Error ? err.message : "Failed to load users");
+    } finally {
+      setLoadingUsers(false);
+    }
+  };
+
+  const refreshSystemStatus = async () => {
+    setLoadingSystemStatus(true);
+    try {
+      const data = await fetchSystemStatus();
+      setSystemStatus(data);
+    } catch {
+      // silent
+    } finally {
+      setLoadingSystemStatus(false);
+    }
+  };
+
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUserActionError("");
+    setUserActionNotice("");
+
+    const pwdCheck = validatePassword(newUserPassword);
+    if (!pwdCheck.isValid) {
+      setUserActionError(pwdCheck.error || `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+
+    setCreatingUser(true);
+    try {
+      const created = await createUser({
+        email: activeUserEmail,
+        password: newUserPassword,
+        name: activeUserName || undefined,
+        role: activeUserRole,
+      });
+      setUserActionNotice(`Successfully created ${created.role} account for ${created.email}`);
+      clearUserDraft();
+      setNewUserEmail("");
+      setNewUserPassword("");
+      setNewUserName("");
+      setNewUserRole("student");
+      await refreshUsersList();
+    } catch (err: unknown) {
+      setUserActionError(err instanceof Error ? err.message : "Failed to create user");
+    } finally {
+      setCreatingUser(false);
+    }
+  };
+
+  const handleDeleteUser = async (userId: string, email: string) => {
+    if (!confirm(`Are you sure you want to delete user account '${email}'?`)) {
+      return;
+    }
+    setUserActionError("");
+    setUserActionNotice("");
+    try {
+      await deleteUser(userId);
+      setUserActionNotice(`User '${email}' deleted successfully.`);
+      await refreshUsersList();
+    } catch (err: unknown) {
+      setUserActionError(err instanceof Error ? err.message : "Failed to delete user");
     }
   };
 
@@ -513,14 +652,29 @@ export default function AdminClientView({
           ? "Academic Data Management"
           : activeTab === "settings"
             ? "Semester Timing Configuration"
-            : "Master Timetable Operations"
+            : activeTab === "users"
+              ? "User & Access Management"
+              : activeTab === "system"
+                ? "System Monitoring & Analytics"
+                : "Master Timetable Operations"
       }
       activeTab={activeTab}
       onTabChange={(t) => {
-        const next = t as "dashboard" | "academic-data" | "faculty" | "curriculum" | "settings";
+        const next = t as
+          | "dashboard"
+          | "academic-data"
+          | "faculty"
+          | "curriculum"
+          | "settings"
+          | "users"
+          | "system";
         if (next === "dashboard") {
           void refreshSections();
           void refreshPublishedTimetables();
+        } else if (next === "users") {
+          void refreshUsersList();
+        } else if (next === "system") {
+          void refreshSystemStatus();
         }
         setActiveTab(next);
       }}
@@ -982,24 +1136,464 @@ export default function AdminClientView({
         </div>
       )}
 
-      {/* Feature 4: Version History Modal */}
-      {showHistoryModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-xl">
+      {/* Admin User Management Tab */}
+      {activeTab === "users" && (
+        <div className="space-y-6">
+          <div className="flex flex-col justify-between gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-center">
+            <div>
+              <h2 className="text-lg font-bold tracking-tight text-slate-900">
+                User & Access Control Management
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">
+                Create and manage university administrator, faculty, and student accounts.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800">
+                <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
+                <span>Password Policy: Min 8 Characters (bcrypt)</span>
+              </span>
+              <button
+                onClick={() => void refreshUsersList()}
+                disabled={loadingUsers}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", loadingUsers && "animate-spin")} />
+                <span>Refresh</span>
+              </button>
+            </div>
+          </div>
+
+          {userActionNotice && (
+            <div className="flex items-center justify-between rounded-md border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs text-emerald-900">
+              <span className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                <span>{userActionNotice}</span>
+              </span>
+              <button onClick={() => setUserActionNotice("")} className="text-emerald-700 hover:text-emerald-900">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
+          {userActionError && (
+            <div className="flex items-center justify-between rounded-md border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-900">
+              <span className="flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-rose-600" />
+                <span>{userActionError}</span>
+              </span>
+              <button onClick={() => setUserActionError("")} className="text-rose-700 hover:text-rose-900">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+            {/* Create Account Card */}
+            <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs">
+              <div className="mb-4 flex items-center gap-2 border-b border-slate-100 pb-3">
+                <div className="rounded-lg bg-slate-900 p-2 text-white">
+                  <UserPlus className="h-4 w-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">Create New Account</h3>
+                  <p className="text-[11px] text-slate-500">Add an administrator or university member.</p>
+                </div>
+              </div>
+
+              {hasRestoredUserDraft && (
+                <div className="mb-3 flex items-center justify-between rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800">
+                  <span>Restored unsaved draft values.</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearUserDraft();
+                      setNewUserName("");
+                      setNewUserEmail("");
+                      setNewUserRole("student");
+                      setNewUserPassword("");
+                    }}
+                    className="font-semibold underline hover:text-amber-950"
+                  >
+                    Discard
+                  </button>
+                </div>
+              )}
+
+              <form onSubmit={handleCreateUser} className="space-y-4">
+                <div>
+                  <label htmlFor="new-user-name" className="block text-xs font-semibold text-slate-700">Full Name</label>
+                  <input
+                    id="new-user-name"
+                    name="name"
+                    type="text"
+                    autoComplete="name"
+                    value={activeUserName}
+                    onChange={(e) => {
+                      setNewUserName(e.target.value);
+                      saveUserDraft({ name: e.target.value });
+                    }}
+                    placeholder="e.g. Dr. Jane Doe"
+                    className="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-hidden"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="new-user-email" className="block text-xs font-semibold text-slate-700">Email Address *</label>
+                  <input
+                    id="new-user-email"
+                    name="email"
+                    type="email"
+                    required
+                    autoComplete="username"
+                    spellCheck={false}
+                    value={activeUserEmail}
+                    onChange={(e) => {
+                      setNewUserEmail(e.target.value);
+                      saveUserDraft({ email: e.target.value });
+                    }}
+                    placeholder="admin@optisched.com"
+                    className="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-hidden"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="new-user-role" className="block text-xs font-semibold text-slate-700">System Role *</label>
+                  <select
+                    id="new-user-role"
+                    name="role"
+                    value={activeUserRole}
+                    onChange={(e) => {
+                      const role = e.target.value as "admin" | "faculty" | "student";
+                      setNewUserRole(role);
+                      saveUserDraft({ role });
+                    }}
+                    className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-hidden"
+                  >
+                    <option value="admin">Administrator (Full Access)</option>
+                    <option value="faculty">Faculty (Teaching Schedule)</option>
+                    <option value="student">Student (Timetable Viewer)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="new-user-password" className="block text-xs font-semibold text-slate-700">Password *</label>
+                    <span
+                      className={cn(
+                        "text-[10px] font-semibold",
+                        newUserPassword.length >= MIN_PASSWORD_LENGTH
+                          ? "text-emerald-600"
+                          : "text-slate-400"
+                      )}
+                    >
+                      {newUserPassword.length >= MIN_PASSWORD_LENGTH
+                        ? "✓ Valid (8+ chars)"
+                        : `${newUserPassword.length}/${MIN_PASSWORD_LENGTH} min chars`}
+                    </span>
+                  </div>
+                  <input
+                    id="new-user-password"
+                    name="new-password"
+                    type="password"
+                    required
+                    autoComplete="new-password"
+                    minLength={MIN_PASSWORD_LENGTH}
+                    value={newUserPassword}
+                    onChange={(e) => setNewUserPassword(e.target.value)}
+                    placeholder="Minimum 8 characters"
+                    className={cn(
+                      "mt-1 w-full rounded-md border px-3 py-2 text-xs text-slate-900 focus:outline-hidden",
+                      newUserPassword && newUserPassword.length < MIN_PASSWORD_LENGTH
+                        ? "border-rose-300 focus:border-rose-500"
+                        : "border-slate-200 focus:border-slate-900"
+                    )}
+                  />
+                  <p className="mt-1.5 text-[10px] text-slate-500 leading-normal">
+                    Stored securely using salted bcrypt hashing ($2b$, 12 rounds). Plain-text passwords are never saved.
+                  </p>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={creatingUser || newUserPassword.length < MIN_PASSWORD_LENGTH || !activeUserEmail}
+                  className="w-full rounded-md bg-slate-900 py-2 text-xs font-semibold text-white shadow-xs hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {creatingUser ? "Creating Account..." : "Create Account"}
+                </button>
+              </form>
+            </div>
+
+            {/* Registered Users Table Card */}
+            <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs lg:col-span-2">
+              <div className="mb-4 flex flex-col justify-between gap-3 border-b border-slate-100 pb-3 sm:flex-row sm:items-center">
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">
+                    Registered Accounts ({usersList.length})
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Accounts identified by 26-character Crockford Base32 ULIDs.
+                  </p>
+                </div>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
+                  <input
+                    type="text"
+                    value={userSearch}
+                    onChange={(e) => setUserSearch(e.target.value)}
+                    placeholder="Search accounts..."
+                    className="h-8 w-48 rounded-md border border-slate-200 pl-8 pr-3 text-xs text-slate-900 focus:border-slate-900 focus:outline-hidden"
+                  />
+                </div>
+              </div>
+
+              {loadingUsers ? (
+                <div className="py-12 text-center text-xs text-slate-500">Loading user accounts...</div>
+              ) : usersList.length === 0 ? (
+                <div className="py-12 text-center text-xs text-slate-500">
+                  No registered accounts found. Click &apos;Refresh&apos; or create a new user.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
+                        <th className="px-3 py-2.5">User</th>
+                        <th className="px-3 py-2.5">Role</th>
+                        <th className="px-3 py-2.5">ULID Identifier</th>
+                        <th className="px-3 py-2.5">Status</th>
+                        <th className="px-3 py-2.5 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {usersList
+                        .filter(
+                          (u) =>
+                            !userSearch ||
+                            u.email.toLowerCase().includes(userSearch.toLowerCase()) ||
+                            (u.name && u.name.toLowerCase().includes(userSearch.toLowerCase())) ||
+                            u.role.toLowerCase().includes(userSearch.toLowerCase())
+                        )
+                        .map((u) => (
+                          <tr key={u.id} className="hover:bg-slate-50/80">
+                            <td className="px-3 py-2.5">
+                              <div className="font-semibold text-slate-900">{u.name || "—"}</div>
+                              <div className="text-[11px] text-slate-500">{u.email}</div>
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <span
+                                className={cn(
+                                  "inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold capitalize",
+                                  u.role === "admin"
+                                    ? "bg-slate-900 text-white"
+                                    : u.role === "faculty"
+                                    ? "bg-blue-50 text-blue-800"
+                                    : "bg-emerald-50 text-emerald-800"
+                                )}
+                              >
+                                {u.role}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2.5 font-mono text-[10px] text-slate-500">
+                              {u.id}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <span
+                                className={cn(
+                                  "inline-flex items-center gap-1 text-[11px] font-medium",
+                                  u.is_active !== false ? "text-emerald-600" : "text-slate-400"
+                                )}
+                              >
+                                <span
+                                  className={cn(
+                                    "h-1.5 w-1.5 rounded-full",
+                                    u.is_active !== false ? "bg-emerald-500" : "bg-slate-300"
+                                  )}
+                                />
+                                {u.is_active !== false ? "Active" : "Disabled"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2.5 text-right">
+                              <button
+                                onClick={() => void handleDeleteUser(u.id, u.email)}
+                                title="Delete User Account"
+                                className="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Admin System Monitoring Tab */}
+      {activeTab === "system" && (
+        <div className="space-y-6">
+          <div className="flex flex-col justify-between gap-4 border-b border-slate-200 pb-5 sm:flex-row sm:items-center">
+            <div>
+              <h2 className="text-lg font-bold tracking-tight text-slate-900">
+                System Monitoring & Dashboard Analytics
+              </h2>
+              <p className="mt-1 text-xs text-slate-500">
+                Real-time operational metrics, infrastructure health, and security policy status.
+              </p>
+            </div>
+            <button
+              onClick={() => void refreshSystemStatus()}
+              disabled={loadingSystemStatus}
+              className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50"
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", loadingSystemStatus && "animate-spin")} />
+              <span>Refresh Status</span>
+            </button>
+          </div>
+
+          {/* Operational Status Badges */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+                <Activity className="h-3.5 w-3.5 text-emerald-600 animate-pulse" />
+                <span>Service Health</span>
+              </div>
+              <div className="mt-2 text-xl font-bold text-slate-900">
+                {systemStatus?.status === "healthy" ? "Operational" : "Active"}
+              </div>
+              <p className="mt-1 text-[11px] text-slate-500">
+                {systemStatus?.service || "OptiSched University Platform"}
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+                <Building className="h-3.5 w-3.5 text-slate-600" />
+                <span>Persistence Layer</span>
+              </div>
+              <div className="mt-2 text-xl font-bold text-slate-900">
+                {systemStatus?.database?.connected ? "Connected" : "Online"}
+              </div>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Engine: {systemStatus?.database?.engine || "PostgreSQL (Neon)"}
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+                <KeyRound className="h-3.5 w-3.5 text-slate-600" />
+                <span>Password Policy</span>
+              </div>
+              <div className="mt-2 text-xl font-bold text-emerald-700">
+                Min {systemStatus?.password_policy?.min_length ?? 8} Characters
+              </div>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Algorithm: {systemStatus?.password_policy?.hashing_algorithm || "bcrypt"} ($2b$, 12 rounds)
+              </p>
+            </div>
+          </div>
+
+          {/* Analytics Matrix */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-xs">
+            <h3 className="text-sm font-bold text-slate-900">Academic Operations Metrics</h3>
+            <p className="text-[11px] text-slate-500">
+              Live count of institutional resources managed by the platform.
+            </p>
+
+            <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-6">
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Total Users</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.total_users ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">
+                  {systemStatus?.analytics?.admins ?? 0} Admins · {systemStatus?.analytics?.faculty_users ?? 0} Faculty
+                </span>
+              </div>
+
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Sections</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.sections ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">Active student classes</span>
+              </div>
+
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Subjects</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.subjects ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">Theory & Lab courses</span>
+              </div>
+
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Faculty</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.faculty_members ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">Qualified professors</span>
+              </div>
+
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Rooms</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.rooms ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">Labs & lecture halls</span>
+              </div>
+
+              <div className="rounded-lg bg-slate-50 p-3">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Timetables</span>
+                <div className="mt-1 text-lg font-bold text-slate-900">
+                  {systemStatus?.analytics?.published_timetables ?? "—"}
+                </div>
+                <span className="text-[10px] text-slate-400">Published verified schedules</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Feature 4: Version History Modal (Google Chrome Modern Web Guidance) */}
+      <dialog
+        ref={historyDialogRef}
+        aria-labelledby="history-modal-title"
+        onClose={() => setShowHistoryModal(false)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {showHistoryModal && (
+          <div>
             <div className="mb-4 flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
                 <div className="rounded-full bg-slate-100 p-2 text-slate-800">
                   <History className="h-4 w-4" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-slate-900">Published Timetable Versions</h3>
+                  <h3 id="history-modal-title" className="text-base font-bold text-slate-900">Published Timetable Versions</h3>
                   <p className="text-xs text-slate-500">
                     Audit log of permanently stored timetables generated by Google OR-Tools CP-SAT.
                   </p>
                 </div>
               </div>
               <button
-                onClick={() => setShowHistoryModal(false)}
+                type="button"
+                onClick={() => historyDialogRef.current?.close()}
                 className="text-slate-400 hover:text-slate-600"
               >
                 <X className="h-4 w-4" />
@@ -1077,15 +1671,17 @@ export default function AdminClientView({
 
             <div className="mt-4 flex justify-end border-t border-slate-100 pt-3">
               <button
-                onClick={() => setShowHistoryModal(false)}
+                type="button"
+                onClick={() => historyDialogRef.current?.close()}
                 className="rounded-md border border-slate-200 px-4 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                autoFocus
               >
                 Close
               </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </PortalShell>
   );
 }

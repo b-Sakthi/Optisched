@@ -577,6 +577,113 @@ class TestAuthSecurity(unittest.TestCase):
         for uid in created_ids:
             self.assertIn(uid, listed_ids)
 
+    def test_password_policy_minimum_8_characters_enforced(self):
+        """Verify strict 8-character password policy on schema, hashing, registration, and login."""
+        from app.core.security import validate_password_policy, hash_password, MIN_PASSWORD_LENGTH
+
+        self.assertEqual(MIN_PASSWORD_LENGTH, 8)
+
+        # 1. Direct policy function rejects < 8 chars and accepts >= 8 chars
+        with self.assertRaises(ValueError):
+            validate_password_policy("1234567")
+        with self.assertRaises(ValueError):
+            hash_password("short")
+
+        # 8-character password must pass
+        valid_8 = "Pass#123"
+        self.assertEqual(len(valid_8), 8)
+        pwd_hash = hash_password(valid_8)
+        self.assertTrue(pwd_hash.startswith(("$2b$", "$2a$", "$2y$")))
+
+        # 2. Registration API rejects < 8 characters (HTTP 422 Unprocessable Entity)
+        res_short = self.client.post(
+            "/api/users",
+            json={"email": "short@optisched.com", "password": "short7!", "role": "student"},
+        )
+        self.assertEqual(res_short.status_code, 422)
+
+        # 3. Login API rejects < 8 characters (HTTP 422 Unprocessable Entity)
+        res_login_short = self.client.post(
+            "/api/auth/login",
+            json={"email": "synth.admin@example.com", "password": "short"},
+        )
+        self.assertEqual(res_login_short.status_code, 422)
+
+        # 4. Password policy endpoint returns min_length 8
+        res_policy = self.client.get("/api/auth/password-policy")
+        self.assertEqual(res_policy.status_code, 200)
+        self.assertEqual(res_policy.json()["min_length"], 8)
+        self.assertEqual(res_policy.json()["algorithm"], "bcrypt")
+
+    def test_user_update_delete_and_system_monitoring(self):
+        """Verify User update/delete endpoints and Admin system monitoring analytics."""
+        # 1. Create a user
+        res_create = self.client.post(
+            "/api/users",
+            json={"email": "temp.admin@optisched.com", "password": "TempAdminPass1!", "role": "admin", "name": "Temp Admin"},
+        )
+        self.assertEqual(res_create.status_code, 201)
+        uid = res_create.json()["id"]
+
+        # 2. Update user name and password (with valid 8+ chars)
+        res_update = self.client.put(
+            f"/api/users/{uid}",
+            json={"name": "Updated Admin Name", "password": "NewSecret88!"},
+        )
+        self.assertEqual(res_update.status_code, 200)
+        self.assertEqual(res_update.json()["name"], "Updated Admin Name")
+
+        # Updating with short password (< 8 chars) must fail with 422
+        res_update_short = self.client.put(
+            f"/api/users/{uid}",
+            json={"password": "tiny1"},
+        )
+        self.assertEqual(res_update_short.status_code, 422)
+
+        # 3. Verify Admin System Monitoring endpoint
+        res_status = self.client.get("/api/admin/system/status")
+        self.assertEqual(res_status.status_code, 200)
+        status_data = res_status.json()
+        self.assertEqual(status_data["status"], "healthy")
+        self.assertEqual(status_data["password_policy"]["min_length"], 8)
+        self.assertEqual(status_data["password_policy"]["hashing_algorithm"], "bcrypt")
+        self.assertIn("analytics", status_data)
+        self.assertGreaterEqual(status_data["analytics"]["total_users"], 1)
+
+        # 4. Delete user
+        res_del = self.client.delete(f"/api/users/{uid}")
+        self.assertEqual(res_del.status_code, 200)
+
+        # Confirm deleted
+        res_get_deleted = self.client.get(f"/api/users/{uid}")
+        self.assertEqual(res_get_deleted.status_code, 404)
+
+    def test_init_admin_environment_provisioning(self):
+        """Verify Admin account creation/initialization via init_admin module."""
+        import init_admin
+
+        # Test rejection of < 8 character admin password
+        with self.assertRaises(ValueError):
+            init_admin.ensure_admin_user_exists(
+                email="admin.short@optisched.com",
+                password="short",
+                force_update_password=True,
+                db_session=self.db,
+            )
+
+        # Test successful admin creation with 8+ chars
+        res = init_admin.ensure_admin_user_exists(
+            email="env.admin@optisched.com",
+            password="ValidAdminPass#99",
+            name="Environment Administrator",
+            force_update_password=True,
+            db_session=self.db,
+        )
+        self.assertEqual(res["role"], "admin")
+        self.assertEqual(res["email"], "env.admin@optisched.com")
+        self.assertTrue(res["is_bcrypt"])
+        self.assertTrue(res["login_verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

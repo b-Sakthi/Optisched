@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { useAuth } from "@clerk/nextjs";
 import {
   Users,
@@ -15,6 +15,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useFormDraft } from "@/lib/useFormDraft";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_OPTISCHED_API_URL ?? "http://127.0.0.1:8000";
@@ -45,7 +46,7 @@ type Subject = {
 };
 
 export function FacultyManagement() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
 
   const [facultyList, setFacultyList] = useState<FacultyMember[]>([]);
   const [allSubjects, setAllSubjects] = useState<Subject[]>([]);
@@ -64,15 +65,65 @@ export function FacultyManagement() {
   const [editingFaculty, setEditingFaculty] = useState<FacultyMember | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // Form Draft Persistence (Google Chrome Modern Web Guidance)
+  const {
+    draft: facultyDraft,
+    hasRestoredDraft: hasRestoredFacultyDraft,
+    saveDraft: saveFacultyDraft,
+    clearDraft: clearFacultyDraft,
+  } = useFormDraft<{
+    employeeId: string;
+    name: string;
+    email: string;
+    department: string;
+  }>({
+    formId: "faculty_create",
+    userId,
+    initialValues: {
+      employeeId: "",
+      name: "",
+      email: "",
+      department: "Computer Science",
+    },
+  });
+
   // Form State
-  const [formEmployeeId, setFormEmployeeId] = useState("");
-  const [formName, setFormName] = useState("");
-  const [formEmail, setFormEmail] = useState("");
-  const [formDepartment, setFormDepartment] = useState("Computer Science");
+  const [formEmployeeId, setFormEmployeeId] = useState<string | null>(null);
+  const [formName, setFormName] = useState<string | null>(null);
+  const [formEmail, setFormEmail] = useState<string | null>(null);
+  const [formDepartment, setFormDepartment] = useState<string | null>(null);
   const [formSelectedSubjects, setFormSelectedSubjects] = useState<number[]>([]);
+
+  const activeEmployeeId = formEmployeeId !== null ? formEmployeeId : (!editingFaculty ? (facultyDraft?.employeeId ?? "") : "");
+  const activeName = formName !== null ? formName : (!editingFaculty ? (facultyDraft?.name ?? "") : "");
+  const activeEmail = formEmail !== null ? formEmail : (!editingFaculty ? (facultyDraft?.email ?? "") : "");
+  const activeDepartment = formDepartment !== null ? formDepartment : (!editingFaculty ? (facultyDraft?.department ?? "Computer Science") : "Computer Science");
 
   // Qualification Drawer/Modal
   const [managingQualsFaculty, setManagingQualsFaculty] = useState<FacultyMember | null>(null);
+
+  const facultyDialogRef = useRef<HTMLDialogElement>(null);
+  const qualsDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = facultyDialogRef.current;
+    if (!dialog) return;
+    if (showAddModal) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [showAddModal]);
+
+  useEffect(() => {
+    const dialog = qualsDialogRef.current;
+    if (!dialog) return;
+    if (managingQualsFaculty) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [managingQualsFaculty]);
 
   // Load Data
   const fetchData = async () => {
@@ -181,10 +232,10 @@ export function FacultyManagement() {
   // Open Create Modal
   const openCreateModal = () => {
     setEditingFaculty(null);
-    setFormEmployeeId(`FAC-CS-0${facultyList.length + 1}`.padStart(10, "0"));
-    setFormName("");
-    setFormEmail("");
-    setFormDepartment("Computer Science");
+    setFormEmployeeId(facultyDraft?.employeeId || `FAC-CS-0${facultyList.length + 1}`.padStart(10, "0"));
+    setFormName(facultyDraft?.name || "");
+    setFormEmail(facultyDraft?.email || "");
+    setFormDepartment(facultyDraft?.department || "Computer Science");
     setFormSelectedSubjects([]);
     setShowAddModal(true);
   };
@@ -209,26 +260,26 @@ export function FacultyManagement() {
           method: "PUT",
           headers,
           body: JSON.stringify({
-            name: formName,
-            email: formEmail,
-            department: formDepartment,
+            name: activeName,
+            email: activeEmail,
+            department: activeDepartment,
           }),
         });
         const body = await res.json().catch(() => null);
         if (!res.ok) {
           throw new Error(body?.detail || `Failed to update faculty (${res.status})`);
         }
-        setSuccess(`Faculty '${formName}' updated successfully.`);
+        setSuccess(`Faculty '${activeName}' updated successfully.`);
       } else {
         // Create
         const res = await fetch(`${API_BASE_URL}/api/faculty`, {
           method: "POST",
           headers,
           body: JSON.stringify({
-            employee_id: formEmployeeId,
-            name: formName,
-            email: formEmail,
-            department: formDepartment,
+            employee_id: activeEmployeeId,
+            name: activeName,
+            email: activeEmail,
+            department: activeDepartment,
           }),
         });
         const body = await res.json().catch(() => null);
@@ -247,6 +298,7 @@ export function FacultyManagement() {
             });
           }
         }
+        clearFacultyDraft();
         setSuccess(`Faculty '${formName}' created successfully.`);
       }
 
@@ -606,18 +658,57 @@ export function FacultyManagement() {
         )}
       </div>
 
-      {/* Add / Edit Faculty Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+      {/* Add / Edit Faculty Modal (Google Chrome Modern Web Guidance) */}
+      <dialog
+        ref={facultyDialogRef}
+        aria-labelledby="faculty-modal-title"
+        onClose={() => setShowAddModal(false)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {showAddModal && (
+          <div>
             <div className="mb-4 flex items-center justify-between border-b border-[#f0f2f7] pb-3">
-              <h3 className="text-base font-bold text-[#20242c]">
+              <h3 id="faculty-modal-title" className="text-base font-bold text-[#20242c]">
                 {editingFaculty ? "Edit Faculty Details" : "Add New Faculty Member"}
               </h3>
-              <button onClick={() => setShowAddModal(false)} className="text-[#8a8f9d] hover:text-black">
+              <button
+                type="button"
+                onClick={() => facultyDialogRef.current?.close()}
+                className="text-[#8a8f9d] hover:text-black"
+              >
                 <X size={18} />
               </button>
             </div>
+
+            {!editingFaculty && hasRestoredFacultyDraft && (
+              <div className="mb-3 flex items-center justify-between rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800">
+                <span>Restored draft faculty details.</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearFacultyDraft();
+                    setFormEmployeeId("");
+                    setFormName("");
+                    setFormEmail("");
+                    setFormDepartment("Computer Science");
+                  }}
+                  className="font-semibold underline hover:text-amber-950"
+                >
+                  Discard
+                </button>
+              </div>
+            )}
 
             <form onSubmit={handleSaveFaculty} className="space-y-4">
               <div>
@@ -627,8 +718,11 @@ export function FacultyManagement() {
                 <input
                   required
                   disabled={Boolean(editingFaculty)}
-                  value={formEmployeeId}
-                  onChange={(e) => setFormEmployeeId(e.target.value)}
+                  value={activeEmployeeId}
+                  onChange={(e) => {
+                    setFormEmployeeId(e.target.value);
+                    if (!editingFaculty) saveFacultyDraft({ employeeId: e.target.value });
+                  }}
                   placeholder="e.g. FAC-CS-041"
                   className="w-full rounded-xl border border-[#e2e4ed] px-3 py-2 text-xs outline-none disabled:bg-[#f7f8fa] disabled:text-[#8a8f9d]"
                 />
@@ -640,8 +734,11 @@ export function FacultyManagement() {
                 </label>
                 <input
                   required
-                  value={formName}
-                  onChange={(e) => setFormName(e.target.value)}
+                  value={activeName}
+                  onChange={(e) => {
+                    setFormName(e.target.value);
+                    if (!editingFaculty) saveFacultyDraft({ name: e.target.value });
+                  }}
                   placeholder="e.g. Dr. Robert Langdon"
                   className="w-full rounded-xl border border-[#e2e4ed] px-3 py-2 text-xs outline-none"
                 />
@@ -654,8 +751,11 @@ export function FacultyManagement() {
                 <input
                   required
                   type="email"
-                  value={formEmail}
-                  onChange={(e) => setFormEmail(e.target.value)}
+                  value={activeEmail}
+                  onChange={(e) => {
+                    setFormEmail(e.target.value);
+                    if (!editingFaculty) saveFacultyDraft({ email: e.target.value });
+                  }}
                   placeholder="e.g. r.langdon@optisched.edu"
                   className="w-full rounded-xl border border-[#e2e4ed] px-3 py-2 text-xs outline-none"
                 />
@@ -667,8 +767,11 @@ export function FacultyManagement() {
                 </label>
                 <input
                   required
-                  value={formDepartment}
-                  onChange={(e) => setFormDepartment(e.target.value)}
+                  value={activeDepartment}
+                  onChange={(e) => {
+                    setFormDepartment(e.target.value);
+                    if (!editingFaculty) saveFacultyDraft({ department: e.target.value });
+                  }}
                   placeholder="e.g. Computer Science"
                   className="w-full rounded-xl border border-[#e2e4ed] px-3 py-2 text-xs outline-none"
                 />
@@ -703,7 +806,7 @@ export function FacultyManagement() {
               <div className="flex items-center justify-end gap-3 pt-3">
                 <button
                   type="button"
-                  onClick={() => setShowAddModal(false)}
+                  onClick={() => facultyDialogRef.current?.close()}
                   className="rounded-xl border border-[#e2e4ed] px-4 py-2 text-xs font-semibold text-[#5a6074] hover:bg-[#f7f8fa]"
                 >
                   Cancel
@@ -718,16 +821,32 @@ export function FacultyManagement() {
               </div>
             </form>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
 
-      {/* Qualifications Modal */}
-      {managingQualsFaculty && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+      {/* Qualifications Modal (Google Chrome Modern Web Guidance) */}
+      <dialog
+        ref={qualsDialogRef}
+        aria-labelledby="quals-modal-title"
+        onClose={() => setManagingQualsFaculty(null)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {managingQualsFaculty && (
+          <div>
             <div className="mb-4 flex items-center justify-between border-b border-[#f0f2f7] pb-3">
               <div>
-                <h3 className="text-base font-bold text-[#20242c]">
+                <h3 id="quals-modal-title" className="text-base font-bold text-[#20242c]">
                   Subject Qualifications
                 </h3>
                 <p className="text-xs text-[#747989]">
@@ -735,7 +854,8 @@ export function FacultyManagement() {
                 </p>
               </div>
               <button
-                onClick={() => setManagingQualsFaculty(null)}
+                type="button"
+                onClick={() => qualsDialogRef.current?.close()}
                 className="text-[#8a8f9d] hover:text-black"
               >
                 <X size={18} />
@@ -802,15 +922,17 @@ export function FacultyManagement() {
 
             <div className="mt-5 flex justify-end">
               <button
-                onClick={() => setManagingQualsFaculty(null)}
+                type="button"
+                onClick={() => qualsDialogRef.current?.close()}
                 className="rounded-xl bg-[#343956] px-4 py-2 text-xs font-semibold text-white hover:bg-[#464d70]"
+                autoFocus
               >
                 Done
               </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </div>
   );
 }

@@ -20,7 +20,12 @@ from dotenv import load_dotenv
 if os.getenv("TESTING") != "1":
     load_dotenv(backend_dir / ".env")
 
-from app.core.security import hash_password, verify_password
+from app.core.security import (
+    hash_password,
+    verify_password,
+    MIN_PASSWORD_LENGTH,
+    validate_password_policy,
+)
 from app.core.ulid import generate_ulid, is_valid_ulid
 from app.db.session import SessionLocal, engine
 from app.models import User
@@ -29,22 +34,28 @@ REQUIRED_DEMO_SPECS = [
     {
         "role": "admin",
         "email_env": "DEMO_ADMIN_EMAIL",
+        "alt_email_env": "ADMIN_EMAIL",
         "default_email": "admin@optisched.com",
         "password_env": "DEMO_ADMIN_PASSWORD",
+        "alt_password_env": "ADMIN_PASSWORD",
         "name": "OptiSched Administrator",
     },
     {
         "role": "faculty",
         "email_env": "DEMO_FACULTY_EMAIL",
+        "alt_email_env": "FACULTY_EMAIL",
         "default_email": "faculty@optisched.com",
         "password_env": "DEMO_FACULTY_PASSWORD",
+        "alt_password_env": "FACULTY_PASSWORD",
         "name": "OptiSched Faculty Member",
     },
     {
         "role": "student",
         "email_env": "DEMO_STUDENT_EMAIL",
+        "alt_email_env": "STUDENT_EMAIL",
         "default_email": "student@optisched.com",
         "password_env": "DEMO_STUDENT_PASSWORD",
+        "alt_password_env": "STUDENT_PASSWORD",
         "name": "OptiSched Student",
     },
 ]
@@ -61,11 +72,12 @@ def load_demo_accounts_from_env() -> list[dict[str, str]]:
     Loads demo account definitions from environment variables.
     Raises ValueError if any required password environment variable is missing or empty.
     """
-    missing_vars = [
-        spec["password_env"]
-        for spec in REQUIRED_DEMO_SPECS
-        if not os.getenv(spec["password_env"], "").strip()
-    ]
+    missing_vars = []
+    for spec in REQUIRED_DEMO_SPECS:
+        pwd = (os.getenv(spec["password_env"]) or os.getenv(spec["alt_password_env"], "")).strip()
+        if not pwd:
+            missing_vars.append(f"{spec['password_env']} (or {spec['alt_password_env']})")
+
     if missing_vars:
         raise ValueError(
             "Missing required environment variable(s) for demo seeding: "
@@ -75,12 +87,13 @@ def load_demo_accounts_from_env() -> list[dict[str, str]]:
 
     accounts: list[dict[str, str]] = []
     for spec in REQUIRED_DEMO_SPECS:
-        password = os.getenv(spec["password_env"], "").strip()
-        if len(password) < 8:
-            raise ValueError(
-                f"Environment variable '{spec['password_env']}' must be at least 8 characters long."
-            )
-        email = os.getenv(spec["email_env"], spec["default_email"]).strip().lower()
+        password = (os.getenv(spec["password_env"]) or os.getenv(spec["alt_password_env"], "")).strip()
+        validate_password_policy(password, role=spec["role"])
+        email = (
+            os.getenv(spec["email_env"])
+            or os.getenv(spec["alt_email_env"])
+            or spec["default_email"]
+        ).strip().lower()
         accounts.append(
             {
                 "email": email,

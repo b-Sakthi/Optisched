@@ -4,9 +4,17 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    if type(dbapi_connection).__module__ in ("sqlite3", "_sqlite3"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 # Only load backend/.env if not executing in test mode
 if os.getenv("TESTING") != "1":
@@ -22,6 +30,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Strict safety verification for test environments
 if os.getenv("TESTING") == "1":
+    if not os.getenv("DATABASE_URL"):
+        os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    DATABASE_URL = os.getenv("DATABASE_URL")
     if not DATABASE_URL or not DATABASE_URL.startswith("sqlite"):
         raise RuntimeError(
             f"CRITICAL SAFETY VIOLATION: Test environment attempted to connect to non-SQLite database: {DATABASE_URL}. "

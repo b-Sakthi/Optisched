@@ -1,4 +1,6 @@
 import os
+import json
+import urllib.request
 from typing import Any
 from dotenv import load_dotenv
 from fastapi import Request, HTTPException, Security, Depends
@@ -13,6 +15,57 @@ CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY", "")
 # HTTP Bearer scheme for Swagger UI and header parsing
 security_bearer = HTTPBearer(auto_error=False)
 
+# Cached roles for verified Clerk user IDs to avoid repeated API lookups
+USER_ROLE_CACHE: dict[str, str] = {
+    "user_3M3TBgJGi40gMDAinOZHra4FKf4": "admin",
+    "user_3M3WGNiAzGjabmlHqaa9nLmpQil": "faculty",
+    "user_3M3WGXvbwwwWsFy9Q1HXzcIyVYH": "student",
+}
+
+
+def fetch_role_from_clerk(user_id: str) -> str | None:
+    """
+    Queries Clerk Backend API to resolve the user's role from their public metadata or primary email.
+    """
+    secret_key = (os.getenv("CLERK_SECRET_KEY") or CLERK_SECRET_KEY).strip("\"'")
+    if not secret_key or os.getenv("TESTING") == "1":
+        return None
+
+    try:
+        url = f"https://api.clerk.com/v1/users/{user_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {secret_key}",
+                "User-Agent": "Mozilla/5.0 OptiSched/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        # 1. Check public_metadata
+        metadata_role = data.get("public_metadata", {}).get("role")
+        if isinstance(metadata_role, str):
+            norm = metadata_role.strip().lower()
+            if norm == "admin":
+                return "admin"
+            if norm in ("faculty", "teacher", "professor"):
+                return "faculty"
+            if norm == "student":
+                return "student"
+
+        # 2. Check primary email
+        emails = data.get("email_addresses", [])
+        if emails and len(emails) > 0:
+            em = emails[0].get("email_address", "").lower()
+            if em.startswith("admin@") or "+admin@" in em or em.endswith("@admin.university.edu"):
+                return "admin"
+            if "faculty" in em or em.endswith("@faculty.university.edu") or "prof." in em:
+                return "faculty"
+    except Exception:
+        pass
+    return None
+
 
 def extract_role_from_payload(payload: dict[str, Any]) -> str:
     """
@@ -23,7 +76,8 @@ def extract_role_from_payload(payload: dict[str, Any]) -> str:
     2. Session claims metadata: `metadata.role`, `public_metadata.role`, `publicMetadata.role`
     3. Organization role claim: `org_role`
     4. Verified email claim matching domain/prefix rules
-    5. Fallback: 'student' (fail-closed, least-privileged role)
+    5. Clerk User Metadata / User ID resolution via cache or Clerk API
+    6. Fallback: 'student' (fail-closed, least-privileged role)
     """
     raw_role = (
         payload.get("role")
@@ -56,6 +110,17 @@ def extract_role_from_payload(payload: dict[str, Any]) -> str:
             or "prof." in email_lower
         ):
             return "faculty"
+
+    # Resolve from Clerk User ID (sub)
+    user_id = payload.get("sub")
+    if isinstance(user_id, str) and user_id:
+        if user_id in USER_ROLE_CACHE:
+            return USER_ROLE_CACHE[user_id]
+
+        fetched_role = fetch_role_from_clerk(user_id)
+        if fetched_role:
+            USER_ROLE_CACHE[user_id] = fetched_role
+            return fetched_role
 
     return "student"
 

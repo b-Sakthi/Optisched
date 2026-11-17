@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useRef, useEffect } from "react";
 import { ScheduleEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -49,6 +49,21 @@ export function TimetableGrid({
 }: TimetableGridProps) {
   const [selectedDay, setSelectedDay] = useState<string>("Monday");
   const [selectedEntry, setSelectedEntry] = useState<ScheduleEntry | null>(null);
+  const inspectorDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = inspectorDialogRef.current;
+    if (!dialog) return;
+    if (selectedEntry) {
+      if (!dialog.open) {
+        dialog.showModal();
+      }
+    } else {
+      if (dialog.open) {
+        dialog.close();
+      }
+    }
+  }, [selectedEntry]);
 
   // Active days extracted dynamically
   const activeDays = useMemo(() => {
@@ -395,29 +410,40 @@ export function TimetableGrid({
         </aside>
       </div>
 
-      {/* Modal Inspector */}
-      {selectedEntry && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
-          onClick={() => setSelectedEntry(null)}
-          role="dialog"
-          aria-modal="true"
-        >
-          <div
-            className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
+      {/* Native Modal Inspector (Google Chrome Modern Web Guidance) */}
+      <dialog
+        ref={inspectorDialogRef}
+        aria-labelledby="session-inspector-title"
+        onClose={() => setSelectedEntry(null)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) {
+            dialog.close();
+          }
+        }}
+        className="m-auto w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-slate-900/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {selectedEntry && (
+          <div>
             <div className="mb-5 flex items-start justify-between">
               <div>
                 <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                   Class Session Inspector
                 </span>
-                <h3 className="mt-1 text-lg font-bold tracking-tight text-slate-900">
+                <h3 id="session-inspector-title" className="mt-1 text-lg font-bold tracking-tight text-slate-900">
                   {selectedEntry.subject}
                 </h3>
               </div>
               <button
-                onClick={() => setSelectedEntry(null)}
+                type="button"
+                onClick={() => inspectorDialogRef.current?.close()}
                 className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
                 aria-label="Close session details"
               >
@@ -448,14 +474,16 @@ export function TimetableGrid({
             </div>
 
             <button
-              onClick={() => setSelectedEntry(null)}
+              type="button"
+              onClick={() => inspectorDialogRef.current?.close()}
               className="mt-6 w-full rounded-md bg-slate-900 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-slate-800"
+              autoFocus
             >
               Done
             </button>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </>
   );
 }

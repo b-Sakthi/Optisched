@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
 import {
   BookOpen,
@@ -16,9 +16,10 @@ import {
 import { API_BASE_URL, fetchWithAuth } from "@/lib/api";
 import { Section, Subject, Room, CourseOffering, FacultyMember } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useFormDraft } from "@/lib/useFormDraft";
 
 export function CurriculumManagement() {
-  const { getToken } = useAuth();
+  const { getToken, userId } = useAuth();
   const [subTab, setSubTab] = useState<"sections" | "subjects" | "rooms" | "offerings">("sections");
 
   const [sections, setSections] = useState<Section[]>([]);
@@ -35,12 +36,45 @@ export function CurriculumManagement() {
   // Modal forms
   const [showModal, setShowModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const modalDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = modalDialogRef.current;
+    if (!dialog) return;
+    if (showModal) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [showModal]);
+
+  // Form Draft Persistence (Google Chrome Modern Web Guidance)
+  const {
+    draft: currDraft,
+    saveDraft: saveCurrDraft,
+    clearDraft: clearCurrDraft,
+    hasRestoredDraft: hasRestoredCurrDraft,
+  } = useFormDraft<{ secName: string; secDept: string; secYear: number; secSem: number }>({
+    formId: "curriculum_section",
+    userId,
+    initialValues: {
+      secName: "",
+      secDept: "Computer Science",
+      secYear: 2,
+      secSem: 4,
+    },
+  });
 
   // Form states
-  const [secName, setSecName] = useState("");
-  const [secDept, setSecDept] = useState("Computer Science");
-  const [secYear, setSecYear] = useState(2);
-  const [secSem, setSecSem] = useState(4);
+  const [secName, setSecName] = useState<string | null>(null);
+  const [secDept, setSecDept] = useState<string | null>(null);
+  const [secYear, setSecYear] = useState<number | null>(null);
+  const [secSem, setSecSem] = useState<number | null>(null);
+
+  const activeSecName = secName !== null ? secName : (currDraft?.secName ?? "");
+  const activeSecDept = secDept !== null ? secDept : (currDraft?.secDept ?? "Computer Science");
+  const activeSecYear = secYear !== null ? secYear : (currDraft?.secYear ?? 2);
+  const activeSecSem = secSem !== null ? secSem : (currDraft?.secSem ?? 4);
 
   const [subCode, setSubCode] = useState("");
   const [subName, setSubName] = useState("");
@@ -130,17 +164,18 @@ export function CurriculumManagement() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              name: secName,
-              department: secDept,
-              academic_year: Number(secYear),
-              semester: Number(secSem),
+              name: activeSecName,
+              department: activeSecDept,
+              academic_year: Number(activeSecYear),
+              semester: Number(activeSecSem),
             }),
           },
           getToken
         );
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Failed to create section");
-        setNotice(`Section ${secName} created successfully.`);
+        setNotice(`Section ${activeSecName} created successfully.`);
+        clearCurrDraft();
         setSecName("");
       } else if (subTab === "subjects") {
         const res = await fetchWithAuth(
@@ -417,34 +452,108 @@ export function CurriculumManagement() {
         </div>
       )}
 
-      {/* Creation Modal */}
-      {showModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 backdrop-blur-[2px]">
-          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+      {/* Creation Modal (Google Chrome Modern Web Guidance) */}
+      <dialog
+        ref={modalDialogRef}
+        aria-labelledby="curriculum-modal-title"
+        onClose={() => setShowModal(false)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/30 backdrop:backdrop-blur-[2px] open:flex open:flex-col"
+      >
+        {showModal && (
+          <div>
             <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-base font-bold text-[#1f2438]">Add New {subTab.slice(0, -1)}</h3>
-              <button onClick={() => setShowModal(false)}><X size={18} /></button>
+              <h3 id="curriculum-modal-title" className="text-base font-bold text-[#1f2438]">Add New {subTab.slice(0, -1)}</h3>
+              <button type="button" onClick={() => modalDialogRef.current?.close()}><X size={18} /></button>
             </div>
+
+            {subTab === "sections" && hasRestoredCurrDraft && (
+              <div className="mb-3 flex items-center justify-between rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800">
+                <span>Restored draft section details.</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearCurrDraft();
+                    setSecName("");
+                    setSecDept("Computer Science");
+                    setSecYear(2);
+                    setSecSem(4);
+                  }}
+                  className="font-semibold underline hover:text-amber-950"
+                >
+                  Discard
+                </button>
+              </div>
+            )}
 
             <form onSubmit={handleCreate} className="space-y-4">
               {subTab === "sections" && (
                 <>
                   <div>
                     <label className="text-[11px] font-semibold text-[#555b69]">Section Name</label>
-                    <input required value={secName} onChange={(e) => setSecName(e.target.value)} placeholder="e.g. CSE-A" className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none" />
+                    <input
+                      required
+                      value={activeSecName}
+                      onChange={(e) => {
+                        setSecName(e.target.value);
+                        saveCurrDraft({ secName: e.target.value });
+                      }}
+                      placeholder="e.g. CSE-A"
+                      className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none"
+                    />
                   </div>
                   <div>
                     <label className="text-[11px] font-semibold text-[#555b69]">Department</label>
-                    <input required value={secDept} onChange={(e) => setSecDept(e.target.value)} className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none" />
+                    <input
+                      required
+                      value={activeSecDept}
+                      onChange={(e) => {
+                        setSecDept(e.target.value);
+                        saveCurrDraft({ secDept: e.target.value });
+                      }}
+                      className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none"
+                    />
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="text-[11px] font-semibold text-[#555b69]">Academic Year</label>
-                      <input type="number" min={1} max={4} value={secYear} onChange={(e) => setSecYear(Number(e.target.value))} className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none" />
+                      <input
+                        type="number"
+                        min={1}
+                        max={4}
+                        value={activeSecYear}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          setSecYear(val);
+                          saveCurrDraft({ secYear: val });
+                        }}
+                        className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none"
+                      />
                     </div>
                     <div>
                       <label className="text-[11px] font-semibold text-[#555b69]">Semester</label>
-                      <input type="number" min={1} max={8} value={secSem} onChange={(e) => setSecSem(Number(e.target.value))} className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none" />
+                      <input
+                        type="number"
+                        min={1}
+                        max={8}
+                        value={activeSecSem}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          setSecSem(val);
+                          saveCurrDraft({ secSem: val });
+                        }}
+                        className="mt-1 w-full rounded-xl border border-[#e5e7ee] p-2.5 text-xs outline-none"
+                      />
                     </div>
                   </div>
                 </>
@@ -537,7 +646,7 @@ export function CurriculumManagement() {
               )}
 
               <div className="flex justify-end gap-2 pt-4 border-t border-[#edf0f5]">
-                <button type="button" onClick={() => setShowModal(false)} className="rounded-xl border border-[#e5e7ee] px-4 py-2 text-xs font-semibold text-[#747989]">
+                <button type="button" onClick={() => modalDialogRef.current?.close()} className="rounded-xl border border-[#e5e7ee] px-4 py-2 text-xs font-semibold text-[#747989]">
                   Cancel
                 </button>
                 <button type="submit" disabled={submitting} className="rounded-xl bg-[#343956] px-4 py-2 text-xs font-semibold text-white hover:bg-[#464d70] disabled:opacity-50">
@@ -546,8 +655,8 @@ export function CurriculumManagement() {
               </div>
             </form>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </div>
   );
 }

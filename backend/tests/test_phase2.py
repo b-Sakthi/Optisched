@@ -239,6 +239,12 @@ class TestPhase2AdvancedScheduling(unittest.TestCase):
     # -------------------- 6. Room-Wise Timetable Retrieval --------------------
     def test_room_wise_timetable_retrieval(self):
         """Room-wise schedule API returns occupied sessions for that specific room."""
+        with SessionLocal() as db:
+            db.add(ClassSection(id=1, name="CSE-1A", department="CS", academic_year=1, semester=1))
+            db.add(Faculty(id=1, employee_id="EMP001", name="Dr. Alice", email="alice@test.com", department="CS"))
+            db.add(Subject(id=1, code="CS101", name="Computing", department="CS"))
+            db.commit()
+
         rm = self.client.post("/api/rooms", json={"name": "AUDITORIUM-1", "room_type": "classroom", "capacity": 200}, headers=self.headers).json()
 
         # Publish a sample schedule using AUDITORIUM-1
@@ -273,6 +279,13 @@ class TestPhase2AdvancedScheduling(unittest.TestCase):
     # -------------------- 7. Successful Timetable Publishing --------------------
     def test_successful_timetable_publishing(self):
         """Valid generated timetable can be persisted and published to database."""
+        with SessionLocal() as db:
+            db.add(ClassSection(id=10, name="CS-3A", department="CS", academic_year=2, semester=3))
+            db.add(Faculty(id=201, employee_id="EMP201", name="Dr. Bob", email="bob@test.com", department="CS"))
+            db.add(Subject(id=101, code="CS301", name="Operating Systems", department="CS"))
+            db.add(Room(id=301, name="CR-101", room_type="classroom", capacity=60, building="Main"))
+            db.commit()
+
         pub_payload = {
             "title": "Fall 2026 CS-3A Timetable",
             "scope": "class",
@@ -333,6 +346,13 @@ class TestPhase2AdvancedScheduling(unittest.TestCase):
     def test_retrieving_published_versions_and_history(self):
         """Preserves version history (version 1, 2) and allows retrieval of both."""
         class_target_id = 99
+        with SessionLocal() as db:
+            db.add(ClassSection(id=class_target_id, name="4A", department="CS", academic_year=2, semester=4))
+            db.add(Faculty(id=1, employee_id="EMP001", name="F1", email="f1@test.com", department="CS"))
+            db.add(Subject(id=1, code="C1", name="N1", department="CS"))
+            db.add(Room(id=1, name="R1", room_type="classroom", capacity=60, building="Main"))
+            db.commit()
+
         # Publish Version 1
         v1_payload = {
             "title": "V1 CS-4A", "scope": "class", "class_id": class_target_id,
@@ -372,6 +392,13 @@ class TestPhase2AdvancedScheduling(unittest.TestCase):
     def test_faculty_and_student_access_to_published_schedules(self):
         """Latest published schedule is accessible via public /api/timetable/published/latest endpoint."""
         target_class_id = 77
+        with SessionLocal() as db:
+            db.add(ClassSection(id=target_class_id, name="CS-Spring", department="CS", academic_year=1, semester=2))
+            db.add(Faculty(id=88, employee_id="EMP088", name="Prof. Web", email="web@test.com", department="CS"))
+            db.add(Subject(id=55, code="CS205", name="Web Systems", department="CS"))
+            db.add(Room(id=99, name="CR-WEB", room_type="classroom", capacity=60, building="Main"))
+            db.commit()
+
         pub_payload = {
             "title": "Official Spring Schedule",
             "scope": "class",

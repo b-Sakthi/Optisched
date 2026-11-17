@@ -15,6 +15,8 @@ import {
   GraduationCap,
   Briefcase,
   Shield,
+  Users,
+  Activity,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -86,6 +88,18 @@ export function PortalShell({
             id: "settings",
             label: "Semester Grid & Timing",
             icon: Sliders,
+            type: "tab" as const,
+          },
+          {
+            id: "users",
+            label: "User Management",
+            icon: Users,
+            type: "tab" as const,
+          },
+          {
+            id: "system",
+            label: "System Monitoring",
+            icon: Activity,
             type: "tab" as const,
           },
         ]

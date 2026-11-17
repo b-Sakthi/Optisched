@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
 import {
   GraduationCap,
@@ -93,6 +93,29 @@ export function AcademicDataManagement({
     id: number;
     name: string;
   } | null>(null);
+
+  const crudDialogRef = useRef<HTMLDialogElement>(null);
+  const deleteDialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = crudDialogRef.current;
+    if (!dialog) return;
+    if (modalType) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [modalType]);
+
+  useEffect(() => {
+    const dialog = deleteDialogRef.current;
+    if (!dialog) return;
+    if (deleteTarget) {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      if (dialog.open) dialog.close();
+    }
+  }, [deleteTarget]);
 
   // Form Fields - Sections
   const [secName, setSecName] = useState("");
@@ -1928,12 +1951,28 @@ export function AcademicDataManagement({
         </div>
       )}
 
-      {/* -------------------- Create / Edit Modal Dialogs -------------------- */}
-      {modalType && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
+      {/* -------------------- Create / Edit Modal Dialogs (Google Chrome Modern Web Guidance) -------------------- */}
+      <dialog
+        ref={crudDialogRef}
+        aria-labelledby="academic-crud-title"
+        onClose={() => setModalType(null)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {modalType && (
+          <div>
             <div className="mb-4 flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900">
+              <h3 id="academic-crud-title" className="text-base font-bold text-slate-900">
                 {modalType.startsWith("create") ? "Add New " : "Edit "}
                 {modalType.includes("section")
                   ? "Class Section"
@@ -1950,7 +1989,8 @@ export function AcademicDataManagement({
                   : "Course Requirement"}
               </h3>
               <button
-                onClick={() => setModalType(null)}
+                type="button"
+                onClick={() => crudDialogRef.current?.close()}
                 className="text-slate-400 hover:text-slate-600"
               >
                 <X className="h-4 w-4" />
@@ -2406,18 +2446,34 @@ export function AcademicDataManagement({
               </div>
             </form>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
 
-      {/* -------------------- Delete Confirmation Dialog -------------------- */}
-      {deleteTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-xl">
+      {/* -------------------- Delete Confirmation Dialog (Google Chrome Modern Web Guidance) -------------------- */}
+      <dialog
+        ref={deleteDialogRef}
+        aria-labelledby="delete-confirm-title"
+        onClose={() => setDeleteTarget(null)}
+        onClick={(e) => {
+          const dialog = e.currentTarget;
+          const rect = dialog.getBoundingClientRect();
+          const isInDialog = (
+            rect.top <= e.clientY &&
+            e.clientY <= rect.top + rect.height &&
+            rect.left <= e.clientX &&
+            e.clientX <= rect.left + rect.width
+          );
+          if (!isInDialog) dialog.close();
+        }}
+        className="m-auto w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-xl backdrop:bg-black/40 backdrop:backdrop-blur-xs open:flex open:flex-col"
+      >
+        {deleteTarget && (
+          <div>
             <div className="flex items-center gap-3 text-rose-600">
               <div className="rounded-full bg-rose-50 p-2">
                 <ShieldAlert className="h-5 w-5 text-rose-600" />
               </div>
-              <h3 className="text-base font-bold text-slate-900">Confirm Deletion</h3>
+              <h3 id="delete-confirm-title" className="text-base font-bold text-slate-900">Confirm Deletion</h3>
             </div>
 
             <p className="mt-3 text-xs text-slate-600">
@@ -2432,8 +2488,9 @@ export function AcademicDataManagement({
             <div className="mt-5 flex items-center justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setDeleteTarget(null)}
+                onClick={() => deleteDialogRef.current?.close()}
                 className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                autoFocus
               >
                 Cancel
               </button>
@@ -2447,8 +2504,8 @@ export function AcademicDataManagement({
               </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </dialog>
     </div>
   );
 }

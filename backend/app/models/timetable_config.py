@@ -1,5 +1,5 @@
-from datetime import datetime
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String
+from datetime import datetime, timezone
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, JSON, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -8,11 +8,19 @@ from app.db.session import Base
 class TimetableConfig(Base):
     __tablename__ = "timetable_configs"
 
+    __table_args__ = (
+        UniqueConstraint("department", "semester", name="uq_timetable_configs_dept_sem"),
+        CheckConstraint("semester BETWEEN 1 AND 8", name="chk_timetable_configs_semester_range"),
+    )
+
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, index=True
     )
+    department: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, default=None, index=True
+    )
     semester: Mapped[int] = mapped_column(
-        Integer, unique=True, nullable=False, index=True
+        Integer, nullable=False, index=True
     )
     days: Mapped[list] = mapped_column(
         JSON, nullable=False
@@ -39,8 +47,8 @@ class TimetableConfig(Base):
         Boolean, default=True, nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False
     )

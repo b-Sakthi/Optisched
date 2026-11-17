@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, ForeignKey, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -6,6 +6,18 @@ from app.db.session import Base
 
 class FacultyAvailability(Base):
     __tablename__ = "faculty_availability"
+
+    __table_args__ = (
+        CheckConstraint(
+            "day IN ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')",
+            name="chk_faculty_availability_day_valid",
+        ),
+        CheckConstraint(
+            "start_time < end_time",
+            name="chk_faculty_availability_time_interval",
+        ),
+        Index("ix_faculty_availability_faculty_day", "faculty_id", "day"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     faculty_id: Mapped[int] = mapped_column(

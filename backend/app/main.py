@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 import csv
 import io
@@ -8,7 +9,8 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy.exc import IntegrityError
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from ortools.sat.python import cp_model
 
 from app.db.session import Base, engine, check_database_connection, SessionLocal
@@ -26,9 +28,14 @@ from app.models import (
     PublishedTimetableEntry,
 )
 from app.core.auth import get_current_user, require_admin, require_authenticated
-from app.core.security import verify_password, hash_password
+from app.core.security import (
+    verify_password,
+    hash_password,
+    MIN_PASSWORD_LENGTH,
+    validate_password_policy,
+)
 from app.core.ulid import generate_ulid, is_valid_ulid
-from app.schemas.user import UserCreate, UserResponse
+from app.schemas.user import UserCreate, UserUpdate, UserResponse
 
 
 # -------------------- Request Schemas --------------------
@@ -156,7 +163,16 @@ class CsvImportRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(
+        min_length=MIN_PASSWORD_LENGTH,
+        description=f"User password (minimum {MIN_PASSWORD_LENGTH} characters)",
+    )
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_min_length(cls, v: str) -> str:
+        validate_password_policy(v)
+        return v
 
 
 # -------------------- Timetable Request Schemas --------------------
@@ -192,6 +208,7 @@ class DaySchedule(BaseModel):
 
 
 class TimetableConfigSave(BaseModel):
+    department: str | None = None
     days: list[DaySchedule] = Field(min_length=1, max_length=7)
     working_hours_start: str | None = None
     working_hours_end: str | None = None
@@ -231,6 +248,13 @@ app.add_middleware(
 @app.on_event("startup")
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    # Automatically initialize admin account from environment if provided (production/dev mode only)
+    if os.getenv("TESTING") != "1":
+        try:
+            from init_admin import ensure_admin_user_exists
+            ensure_admin_user_exists()
+        except Exception:
+            pass
 
 
 def get_db():
@@ -293,6 +317,19 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)):
             "name": user.name,
         },
         "target_dashboard": dashboard_map.get(user.role, "/student"),
+    }
+
+
+@app.get("/api/auth/password-policy")
+def get_password_policy():
+    """
+    Returns current application password policy settings.
+    Enforces minimum 8 characters across all roles.
+    """
+    return {
+        "min_length": MIN_PASSWORD_LENGTH,
+        "algorithm": "bcrypt",
+        "description": f"Minimum password length is {MIN_PASSWORD_LENGTH} characters for all accounts including Admin.",
     }
 
 
@@ -370,6 +407,111 @@ def create_user(user_in: UserCreate, db: Session = Depends(get_db)):
         created_at=new_user.created_at,
         updated_at=new_user.updated_at,
     )
+
+
+@app.put("/api/users/{user_id}", response_model=UserResponse)
+def update_user(user_id: str, user_update: UserUpdate, db: Session = Depends(get_db)):
+    """
+    Updates an existing user. If a new password is provided, strictly validates
+    the minimum 8-character policy and re-hashes with bcrypt.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User with ID '{user_id}' not found")
+
+    if user_update.email is not None:
+        email_clean = str(user_update.email).strip().lower()
+        conflict = db.query(User).filter(User.email == email_clean, User.id != user_id).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail=f"User with email '{email_clean}' already exists")
+        user.email = email_clean
+
+    if user_update.name is not None:
+        user.name = user_update.name
+    if user_update.role is not None:
+        user.role = user_update.role
+    if user_update.is_active is not None:
+        user.is_active = user_update.is_active
+    if user_update.password is not None:
+        validate_password_policy(user_update.password, role=user.role)
+        user.password_hash = hash_password(user_update.password)
+
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+    return UserResponse(
+        id=user.id,
+        id_str=str(user.id),
+        email=user.email,
+        role=user.role,
+        name=user.name,
+        is_active=user.is_active,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )
+
+
+@app.delete("/api/users/{user_id}", status_code=200)
+def delete_user(user_id: str, db: Session = Depends(get_db)):
+    """
+    Deletes a user account by ULID.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User with ID '{user_id}' not found")
+    db.delete(user)
+    db.commit()
+    return {"status": "success", "message": f"User '{user_id}' successfully deleted"}
+
+
+# -------------------- Admin System Monitoring APIs --------------------
+@app.get("/api/admin/system/status")
+def get_system_status(db: Session = Depends(get_db)):
+    """
+    Provides real-time system metrics, database health, entity counts,
+    and security policy configuration for Admin monitoring and dashboard analytics.
+    """
+    user_count = db.query(User).count()
+    section_count = db.query(ClassSection).count()
+    subject_count = db.query(Subject).count()
+    faculty_count = db.query(Faculty).count()
+    room_count = db.query(Room).count()
+    offering_count = db.query(CourseOffering).count()
+    config_count = db.query(TimetableConfig).count()
+    published_count = db.query(PublishedTimetable).count()
+
+    admin_count = db.query(User).filter(User.role == "admin").count()
+    faculty_user_count = db.query(User).filter(User.role == "faculty").count()
+    student_user_count = db.query(User).filter(User.role == "student").count()
+
+    return {
+        "status": "healthy",
+        "service": "OptiSched University Operations Platform",
+        "version": "0.2.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": {
+            "connected": True,
+            "engine": engine.dialect.name,
+        },
+        "password_policy": {
+            "min_length": MIN_PASSWORD_LENGTH,
+            "hashing_algorithm": "bcrypt",
+            "enforced_roles": ["admin", "faculty", "student"],
+        },
+        "analytics": {
+            "total_users": user_count,
+            "admins": admin_count,
+            "faculty_users": faculty_user_count,
+            "student_users": student_user_count,
+            "sections": section_count,
+            "subjects": subject_count,
+            "faculty_members": faculty_count,
+            "rooms": room_count,
+            "course_offerings": offering_count,
+            "timetable_configs": config_count,
+            "published_timetables": published_count,
+        },
+    }
 
 
 # -------------------- Faculty APIs --------------------
@@ -723,8 +865,17 @@ def create_section(
         raise HTTPException(status_code=400, detail="Academic year must be between 1 and 4")
     if section_data.student_count is not None and section_data.student_count < 1:
         raise HTTPException(status_code=400, detail="Student count must be a positive integer")
-    if db.query(ClassSection).filter(ClassSection.name == name_clean).first():
-        raise HTTPException(status_code=409, detail=f"Section name '{name_clean}' already exists")
+    existing = db.query(ClassSection).filter(
+        ClassSection.department == dept_clean,
+        ClassSection.academic_year == section_data.academic_year,
+        ClassSection.semester == section_data.semester,
+        ClassSection.name == name_clean,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Section '{name_clean}' already exists in department '{dept_clean}' (Year {section_data.academic_year}, Semester {section_data.semester})",
+        )
     section = ClassSection(
         name=name_clean, department=dept_clean,
         academic_year=section_data.academic_year, semester=section_data.semester,
@@ -735,6 +886,12 @@ def create_section(
         db.add(section)
         db.commit()
         db.refresh(section)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Section '{name_clean}' already exists in department '{dept_clean}' (Year {section_data.academic_year}, Semester {section_data.semester})",
+        )
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not create section")
@@ -796,21 +953,42 @@ def update_section(
     if not sec:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    if section_data.name is not None:
-        name_clean = section_data.name.strip()
-        if not name_clean:
-            raise HTTPException(status_code=400, detail="Section name cannot be empty")
-        if name_clean != sec.name:
-            if db.query(ClassSection).filter(ClassSection.name == name_clean, ClassSection.id != section_id).first():
-                raise HTTPException(status_code=409, detail=f"Section name '{name_clean}' already in use")
-            sec.name = name_clean
+    name_clean = section_data.name.strip() if section_data.name is not None else None
+    if name_clean is not None and not name_clean:
+        raise HTTPException(status_code=400, detail="Section name cannot be empty")
 
-    if section_data.department is not None:
-        dept_clean = section_data.department.strip()
-        if not dept_clean:
-            raise HTTPException(status_code=400, detail="Department cannot be empty")
+    dept_clean = section_data.department.strip() if section_data.department is not None else None
+    if dept_clean is not None and not dept_clean:
+        raise HTTPException(status_code=400, detail="Department cannot be empty")
+
+    target_name = name_clean if name_clean is not None else sec.name
+    target_dept = dept_clean if dept_clean is not None else sec.department
+    target_year = section_data.academic_year if section_data.academic_year is not None else sec.academic_year
+    target_sem = section_data.semester if section_data.semester is not None else sec.semester
+
+    if (
+        section_data.name is not None
+        or section_data.department is not None
+        or section_data.academic_year is not None
+        or section_data.semester is not None
+    ):
+        dup = db.query(ClassSection).filter(
+            ClassSection.department == target_dept,
+            ClassSection.academic_year == target_year,
+            ClassSection.semester == target_sem,
+            ClassSection.name == target_name,
+            ClassSection.id != section_id,
+        ).first()
+        if dup:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Section '{target_name}' already in use in department '{target_dept}' (Year {target_year}, Semester {target_sem})",
+            )
+
+    if name_clean is not None:
+        sec.name = name_clean
+    if dept_clean is not None:
         sec.department = dept_clean
-
     if section_data.academic_year is not None:
         sec.academic_year = section_data.academic_year
     if section_data.semester is not None:
@@ -825,6 +1003,12 @@ def update_section(
     try:
         db.commit()
         db.refresh(sec)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Section '{sec.name}' already in use in department '{sec.department}' (Year {sec.academic_year}, Semester {sec.semester})",
+        )
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not update section")
@@ -1057,17 +1241,24 @@ def create_room(
             status_code=400,
             detail="Room type must be classroom or lab",
         )
-    if db.query(Room).filter(Room.name == name_clean).first():
-        raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists")
+    bldg_clean = room_data.building.strip() if room_data.building else None
+    bldg_filter = Room.building == bldg_clean if bldg_clean else Room.building.is_(None)
+    if db.query(Room).filter(Room.name == name_clean, bldg_filter).first():
+        bldg_name = bldg_clean or "Default Building"
+        raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists in '{bldg_name}'")
     room = Room(
         name=name_clean, room_type=norm_type,
-        capacity=room_data.capacity, building=room_data.building.strip() if room_data.building else None,
+        capacity=room_data.capacity, building=bldg_clean,
         is_active=room_data.is_active,
     )
     try:
         db.add(room)
         db.commit()
         db.refresh(room)
+    except IntegrityError:
+        db.rollback()
+        bldg_name = bldg_clean or "Default Building"
+        raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists in '{bldg_name}'")
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not create room")
@@ -1112,14 +1303,23 @@ def update_room(
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
 
-    if room_data.name is not None:
-        name_clean = room_data.name.strip()
-        if not name_clean:
-            raise HTTPException(status_code=400, detail="Room name cannot be empty")
-        if name_clean != room.name:
-            if db.query(Room).filter(Room.name == name_clean, Room.id != room_id).first():
-                raise HTTPException(status_code=409, detail=f"Room name '{name_clean}' already exists")
-            room.name = name_clean
+    name_clean = room_data.name.strip() if room_data.name is not None else None
+    if name_clean is not None and not name_clean:
+        raise HTTPException(status_code=400, detail="Room name cannot be empty")
+
+    target_name = name_clean if name_clean is not None else room.name
+    target_bldg = (room_data.building.strip() or None) if room_data.building is not None else room.building
+
+    if room_data.name is not None or room_data.building is not None:
+        bldg_filter = Room.building == target_bldg if target_bldg else Room.building.is_(None)
+        if db.query(Room).filter(Room.name == target_name, bldg_filter, Room.id != room_id).first():
+            bldg_name = target_bldg or "Default Building"
+            raise HTTPException(status_code=409, detail=f"Room name '{target_name}' already exists in '{bldg_name}'")
+
+    if name_clean is not None:
+        room.name = name_clean
+    if room_data.building is not None:
+        room.building = target_bldg
 
     if room_data.room_type is not None:
         norm_type = room_data.room_type.strip().lower()
@@ -1136,15 +1336,16 @@ def update_room(
             raise HTTPException(status_code=400, detail="Room capacity must be greater than zero")
         room.capacity = room_data.capacity
 
-    if room_data.building is not None:
-        room.building = room_data.building.strip() or None
-
     if room_data.is_active is not None:
         room.is_active = room_data.is_active
 
     try:
         db.commit()
         db.refresh(room)
+    except IntegrityError:
+        db.rollback()
+        bldg_name = room.building or "Default Building"
+        raise HTTPException(status_code=409, detail=f"Room name '{room.name}' already in use in '{bldg_name}'")
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not update room")
@@ -1293,6 +1494,9 @@ def create_course_offering(
         db.add(offering)
         db.commit()
         db.refresh(offering)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"Subject '{subject.code}' is already assigned to section '{section.name}' or violates constraints")
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not create course offering")
@@ -1415,6 +1619,8 @@ def update_course_offering(
     off.subject_id = target_subject_id
     off.faculty_id = target_faculty_id
     if offering_data.weekly_periods is not None:
+        if offering_data.weekly_periods < 1:
+            raise HTTPException(status_code=400, detail="Weekly periods must be at least 1")
         off.weekly_periods = offering_data.weekly_periods
     if offering_data.requires_lab is not None:
         off.requires_lab = offering_data.requires_lab
@@ -1422,6 +1628,9 @@ def update_course_offering(
     try:
         db.commit()
         db.refresh(off)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"Subject '{sub.code}' is already assigned to section '{sec.name}' or violates constraints")
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not update course offering")
@@ -1632,11 +1841,15 @@ def _flatten_and_validate_days(
 
 # -------------------- Timetable Configuration APIs --------------------
 @app.get("/api/timetable/configurations")
-def list_timetable_configurations(db: Session = Depends(get_db)):
-    configs = db.query(TimetableConfig).order_by(TimetableConfig.semester.asc()).all()
+def list_timetable_configurations(department: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(TimetableConfig)
+    if department:
+        query = query.filter(TimetableConfig.department == department.strip())
+    configs = query.order_by(TimetableConfig.semester.asc()).all()
     return [
         {
             "id": c.id,
+            "department": c.department,
             "semester": c.semester,
             "days": c.days,
             "working_hours_start": c.working_hours_start,
@@ -1655,17 +1868,23 @@ def list_timetable_configurations(db: Session = Depends(get_db)):
 
 
 @app.get("/api/timetable/configurations/{semester}")
-def get_timetable_configuration(semester: int, db: Session = Depends(get_db)):
+def get_timetable_configuration(semester: int, department: str | None = None, db: Session = Depends(get_db)):
     if not 1 <= semester <= 8:
         raise HTTPException(status_code=400, detail="Semester must be between 1 and 8.")
 
-    config = db.query(TimetableConfig).filter(
-        TimetableConfig.semester == semester
-    ).first()
+    query = db.query(TimetableConfig).filter(TimetableConfig.semester == semester)
+    if department:
+        dept_clean = department.strip()
+        config = query.filter(TimetableConfig.department == dept_clean).first()
+        if not config:
+            config = query.filter(TimetableConfig.department.is_(None)).first()
+    else:
+        config = query.first()
 
     if config:
         return {
             "id": config.id,
+            "department": config.department,
             "semester": config.semester,
             "days": config.days,
             "working_hours_start": config.working_hours_start,
@@ -1685,6 +1904,7 @@ def get_timetable_configuration(semester: int, db: Session = Depends(get_db)):
     default_breaks_dict = [b.model_dump() for b in DEFAULT_BREAKS]
     return {
         "semester": semester,
+        "department": department.strip() if department else None,
         "days": default_days_dict,
         "working_hours_start": "09:00",
         "working_hours_end": "16:00",
@@ -1702,11 +1922,14 @@ def get_timetable_configuration(semester: int, db: Session = Depends(get_db)):
 def save_timetable_configuration(
     semester: int,
     data: TimetableConfigSave,
+    department: str | None = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(require_admin),
 ):
     if not 1 <= semester <= 8:
         raise HTTPException(status_code=400, detail="Semester must be between 1 and 8.")
+
+    dept_target = data.department.strip() if data.department else (department.strip() if department else None)
 
     flattened = _flatten_and_validate_days(
         data.days,
@@ -1730,9 +1953,11 @@ def save_timetable_configuration(
     serialized_breaks = [b.model_dump() for b in data.breaks] if data.breaks is not None else []
     serialized_lunch = data.lunch_break.model_dump() if data.lunch_break else None
 
-    config = db.query(TimetableConfig).filter(
-        TimetableConfig.semester == semester
-    ).first()
+    config_query = db.query(TimetableConfig).filter(TimetableConfig.semester == semester)
+    if dept_target:
+        config = config_query.filter(TimetableConfig.department == dept_target).first()
+    else:
+        config = config_query.filter(TimetableConfig.department.is_(None)).first()
 
     if config:
         config.days = serialized_days
@@ -1743,9 +1968,10 @@ def save_timetable_configuration(
         config.breaks = serialized_breaks
         config.lunch_break = serialized_lunch
         config.is_active = data.is_active
-        config.updated_at = datetime.utcnow()
+        config.updated_at = datetime.now(timezone.utc)
     else:
         config = TimetableConfig(
+            department=dept_target,
             semester=semester,
             days=serialized_days,
             working_hours_start=start_wh,
@@ -1761,6 +1987,12 @@ def save_timetable_configuration(
     try:
         db.commit()
         db.refresh(config)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Configuration for semester {semester} in department '{dept_target or 'Default'}' already exists.",
+        ) from exc
     except Exception as exc:
         db.rollback()
         raise HTTPException(
@@ -2026,6 +2258,9 @@ def create_faculty_availability(
         db.add(record)
         db.commit()
         db.refresh(record)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Faculty availability violates database constraints")
     except Exception:
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not save faculty availability")
@@ -2808,16 +3043,21 @@ def generate_timetable(
             TimetableConfig.is_active.is_(True),
         ).all()
         for cfg in configs_in_db:
-            saved_configs_raw[cfg.semester] = cfg
-            saved_configs[cfg.semester] = [
-                DaySchedule.model_validate(d) for d in cfg.days
-            ]
+            parsed_days = [DaySchedule.model_validate(d) for d in cfg.days]
+            if cfg.department:
+                saved_configs_raw[(cfg.department, cfg.semester)] = cfg
+                saved_configs[(cfg.department, cfg.semester)] = parsed_days
+            else:
+                saved_configs_raw[cfg.semester] = cfg
+                saved_configs[cfg.semester] = parsed_days
 
     section_slots: dict[int, list[dict]] = {}
     section_days: dict[int, list[DaySchedule]] = {}
     for section in sections:
         if request.days is not None:
             days_to_use = request.days
+        elif (section.department, section.semester) in saved_configs:
+            days_to_use = saved_configs[(section.department, section.semester)]
         elif section.semester in saved_configs:
             days_to_use = saved_configs[section.semester]
         else:
@@ -3307,6 +3547,7 @@ def publish_timetable(
         fs_map.setdefault(fs.subject_id, set()).add(fs.faculty_id)
 
     sections_map = {s.id: s for s in db.query(ClassSection).all()}
+
     blocked_avail = db.query(FacultyAvailability).filter(FacultyAvailability.is_available.is_(False)).all()
     blocked_map: dict[int, list[tuple[str, int, int]]] = {}
     for b in blocked_avail:
@@ -3337,6 +3578,21 @@ def publish_timetable(
             status_code=400,
             detail=f"Cannot publish schedule with unresolved conflicts: {', '.join(clash_summary)}.",
         )
+
+    # Validate referential integrity of schedule entities before persisting
+    for row in request.schedule:
+        c_id = row.get("class_id")
+        f_id = row.get("faculty_id")
+        r_id = row.get("room_id")
+        s_id = row.get("subject_id")
+        if c_id not in sections_map:
+            raise HTTPException(status_code=400, detail=f"Cannot publish schedule: referenced class_id {c_id} does not exist.")
+        if f_id not in faculty_map:
+            raise HTTPException(status_code=400, detail=f"Cannot publish schedule: referenced faculty_id {f_id} does not exist.")
+        if r_id not in rooms_map:
+            raise HTTPException(status_code=400, detail=f"Cannot publish schedule: referenced room_id {r_id} does not exist.")
+        if s_id not in subject_map:
+            raise HTTPException(status_code=400, detail=f"Cannot publish schedule: referenced subject_id {s_id} does not exist.")
 
     # 2. Versioning: Find previous version for this scope/class/semester to preserve historical records
     version_query = db.query(PublishedTimetable)
@@ -3405,6 +3661,12 @@ def publish_timetable(
     try:
         db.commit()
         db.refresh(pub_table)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot publish schedule: referenced entity does not exist or violates database constraints: {str(exc)}",
+        )
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to publish timetable: {str(exc)}")

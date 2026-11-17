@@ -363,8 +363,8 @@ export function TimetableSettings({
       return;
     }
 
-    // Sort breaks by start time
-    const sortedBreaks = [...breaks].sort(
+    // Sort breaks by start time (ES2023+ toSorted)
+    const sortedBreaks = breaks.toSorted(
       (a, b) => toMinutes(a.start_time) - toMinutes(b.start_time),
     );
 

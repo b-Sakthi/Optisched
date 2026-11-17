@@ -182,6 +182,37 @@ export type User = {
   role: "admin" | "faculty" | "student";
   name?: string | null;
   is_active?: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type SystemStatus = {
+  status: string;
+  service: string;
+  version: string;
+  timestamp: string;
+  database: {
+    connected: boolean;
+    engine: string;
+  };
+  password_policy: {
+    min_length: number;
+    hashing_algorithm: string;
+    enforced_roles: string[];
+  };
+  analytics: {
+    total_users: number;
+    admins: number;
+    faculty_users: number;
+    student_users: number;
+    sections: number;
+    subjects: number;
+    faculty_members: number;
+    rooms: number;
+    course_offerings: number;
+    timetable_configs: number;
+    published_timetables: number;
+  };
 };
 
 export type AuthLoginResponse = {
